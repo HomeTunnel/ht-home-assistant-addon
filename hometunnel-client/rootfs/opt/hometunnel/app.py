@@ -2463,21 +2463,31 @@ def select_core_config_target() -> tuple[Optional[Dict[str, Any]], Optional[str]
 def resolve_route_target(options: Dict[str, Any], state: Dict[str, Any]) -> Dict[str, Any]:
     explicit_value = str(options.get("home_assistant_target") or options.get("home_assistant_url") or "").strip()
     cached_route = dict(state.get("route") or {})
-    candidates: list[tuple[str, Optional[Dict[str, Any]], Optional[str]]] = []
-    candidates.append(("configured_target", parse_target_input(explicit_value), None if explicit_value else "not_configured"))
-    candidates.append(("homeassistant_local", parse_target_input("http://homeassistant.local:8123"), None))
     cached_value = str(cached_route.get("target_hostname") or cached_route.get("target_ip") or cached_route.get("target_host") or "").strip()
-    candidates.append(("last_known_good", parse_target_input(cached_value), None if cached_value else "no_cached_target"))
     try:
         supervisor_candidate, supervisor_error = select_supervisor_host_target()
     except Exception as exc:
         supervisor_candidate, supervisor_error = None, str(exc)
-    candidates.append(("supervisor_network", supervisor_candidate, supervisor_error))
     try:
         core_candidate, core_error = select_core_config_target()
     except Exception as exc:
         core_candidate, core_error = None, str(exc)
-    candidates.append(("core_config", core_candidate, core_error))
+
+    # Order matters: the first candidate that resolves is selected (see the loop
+    # below). Prefer sources that describe THIS device's own Home Assistant --
+    # explicit config, then the Supervisor's own primary interface, then Core's
+    # configured URL -- before falling back to cached state or the shared
+    # "homeassistant.local" mDNS name. That generic name is NOT unique: on a LAN
+    # with more than one HAOS device it can resolve to a *different* device, which
+    # would make this addon target the wrong Home Assistant. It must therefore
+    # only ever be a last resort, never win over the local device's own address.
+    candidates: list[tuple[str, Optional[Dict[str, Any]], Optional[str]]] = [
+        ("configured_target", parse_target_input(explicit_value), None if explicit_value else "not_configured"),
+        ("supervisor_network", supervisor_candidate, supervisor_error),
+        ("core_config", core_candidate, core_error),
+        ("last_known_good", parse_target_input(cached_value), None if cached_value else "no_cached_target"),
+        ("homeassistant_local", parse_target_input("http://homeassistant.local:8123"), None),
+    ]
 
     errors: list[str] = []
     selected: Optional[Dict[str, Any]] = None
