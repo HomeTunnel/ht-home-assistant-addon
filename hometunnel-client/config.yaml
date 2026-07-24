@@ -22,5 +22,7 @@ hassio_api: true
 watchdog: http://[HOST]:[PORT:8099]/health
 options:
   log_level: info
+  allow_low_memory: false
 schema:
   log_level: "list(trace|debug|info|warn|error)"
+  allow_low_memory: "bool?"
