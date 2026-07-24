@@ -42,6 +42,14 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
+      - name: Set up QEMU
+        # Register binfmt/QEMU handlers so the cross-architecture (aarch64) image
+        # can be built under emulation on the x86 runner. Without this the arm64
+        # base image's shell fails with "exec /bin/ash: exec format error". The
+        # builder can register QEMU implicitly, but that is racy — pin it here so
+        # builds are deterministic.
+        uses: docker/setup-qemu-action@v3
+
       - name: Log in to GitHub Container Registry
         # Only needed when we actually push (not on pull requests).
         if: github.event_name != 'pull_request'
