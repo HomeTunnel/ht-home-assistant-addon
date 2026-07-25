@@ -279,6 +279,121 @@ class SupervisorHostTargetTests(unittest.TestCase):
         self.assertEqual(error, "no_primary_interface_ip")
 
 
+class RouteTargetCacheTrustTests(unittest.TestCase):
+    def test_poisoned_mdns_cache_rejected(self) -> None:
+        # The exact shape from the field: a cached homeassistant.local entry that
+        # keeps re-winning as "last_known_good" and pinning the neighbor's IP.
+        cached = {
+            "target_hostname": "homeassistant.local",
+            "target_ip": "192.168.68.141",
+            "target_host": "homeassistant.local",
+            "target_source": "last_known_good",
+        }
+        self.assertEqual(app.trusted_cached_route_value(cached), "")
+
+    def test_mdns_origin_ip_rejected(self) -> None:
+        cached = {
+            "target_ip": "192.168.68.141",
+            "target_source": "homeassistant_local",
+            "target_source_origin": "homeassistant_local",
+        }
+        self.assertEqual(app.trusted_cached_route_value(cached), "")
+
+    def test_supervisor_origin_ip_trusted(self) -> None:
+        cached = {
+            "target_ip": "192.168.68.151",
+            "target_source": "last_known_good",
+            "target_source_origin": "supervisor_network",
+        }
+        self.assertEqual(app.trusted_cached_route_value(cached), "192.168.68.151")
+
+    def test_configured_hostname_trusted(self) -> None:
+        cached = {
+            "target_hostname": "my-ha.lan",
+            "target_source_origin": "configured_target",
+        }
+        self.assertEqual(app.trusted_cached_route_value(cached), "my-ha.lan")
+
+
+class HaProxyUpstreamResolverTests(unittest.TestCase):
+    def _resolver(self, cache_payload: dict | None = None) -> "app.HomeAssistantUpstreamResolver":
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        cache_path = pathlib.Path(tmp.name) / "ha_proxy_cache.json"
+        if cache_payload is not None:
+            cache_path.write_text(json.dumps(cache_payload), encoding="utf-8")
+        with patch.object(app, "update_proxy_runtime_state"):
+            return app.HomeAssistantUpstreamResolver(cache_path)
+
+    def test_internal_service_probed_before_mdns(self) -> None:
+        resolver = self._resolver()
+        with patch.object(app, "load_options", return_value={}):
+            order = [source for source, _ in resolver._candidate_urls()]
+        self.assertIn("homeassistant_service", order)
+        self.assertIn("homeassistant_local", order)
+        self.assertLess(order.index("homeassistant_service"), order.index("homeassistant_local"))
+
+    def test_mdns_cache_is_not_loaded(self) -> None:
+        resolver = self._resolver({"last_known_good_url": "http://homeassistant.local:8123"})
+        self.assertIsNone(resolver._current_url)
+
+    def test_trusted_cache_is_loaded(self) -> None:
+        resolver = self._resolver({"last_known_good_url": "http://192.168.68.151:8123"})
+        self.assertEqual(resolver._current_url, "http://192.168.68.151:8123")
+
+    def test_mdns_url_is_not_persisted(self) -> None:
+        resolver = self._resolver()
+        with (
+            patch.object(app, "update_proxy_runtime_state"),
+            patch.object(app, "ensure_data_dir"),
+        ):
+            resolver._store_cache("http://homeassistant.local:8123", "homeassistant_local", app.now_iso(), None)
+        cached = json.loads(resolver._cache_path.read_text(encoding="utf-8"))
+        self.assertIsNone(cached["last_known_good_url"])
+        self.assertIsNone(cached["last_known_good_source"])
+
+    def test_non_mdns_url_is_persisted(self) -> None:
+        resolver = self._resolver()
+        with (
+            patch.object(app, "update_proxy_runtime_state"),
+            patch.object(app, "ensure_data_dir"),
+        ):
+            resolver._store_cache("http://homeassistant:8123", "homeassistant_service", app.now_iso(), None)
+        cached = json.loads(resolver._cache_path.read_text(encoding="utf-8"))
+        self.assertEqual(cached["last_known_good_url"], "http://homeassistant:8123")
+
+
+class NetbirdStatusTextFallbackTests(unittest.TestCase):
+    def _collect_with_text_output(self, text: str) -> dict:
+        app._netbird_status_cache["value"] = None
+        app._netbird_status_cache["at"] = 0.0
+        calls = {"n": 0}
+
+        def fake_run_command(args, timeout_seconds=10):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                return 1, "", "json unavailable"
+            return 1, "", text
+
+        try:
+            with (
+                patch.object(app, "netbird_binary_path", return_value="/usr/local/bin/netbird"),
+                patch.object(app, "run_command", side_effect=fake_run_command),
+            ):
+                return app.collect_netbird_status()
+        finally:
+            app._netbird_status_cache["value"] = None
+            app._netbird_status_cache["at"] = 0.0
+
+    def test_error_text_is_not_parsed_as_peer_ip(self) -> None:
+        value = self._collect_with_text_output("TimeoutExpired: Command '['netbird', 'status']' timed out")
+        self.assertIsNone(value["peer_ip"])
+
+    def test_real_ip_is_still_extracted(self) -> None:
+        value = self._collect_with_text_output("Connected, NetBird IP: 100.87.34.152/16 management: Connected")
+        self.assertEqual(value["peer_ip"], "100.87.34.152")
+
+
 class PairingStateMachineTests(unittest.TestCase):
     def setUp(self) -> None:
         self.tmp = tempfile.TemporaryDirectory()

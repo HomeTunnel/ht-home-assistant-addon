@@ -1815,7 +1815,10 @@ def collect_netbird_status() -> Dict[str, Any]:
     peer_ip = None
     for token in text.replace(",", " ").split():
         normalized = normalize_netbird_ip(token)
-        if normalized:
+        # normalize_netbird_ip passes non-IP text through (it tolerates
+        # hostnames); this token scan must only accept real IP addresses or
+        # error text like "TimeoutExpired:" ends up as the peer IP.
+        if normalized and is_ip_address(normalized):
             peer_ip = normalized
             break
     LOG.debug(
@@ -2562,10 +2565,37 @@ def select_core_config_target() -> tuple[Optional[Dict[str, Any]], Optional[str]
     return None, "core_urls_missing"
 
 
+AMBIGUOUS_TARGET_HOSTNAME = "homeassistant.local"
+UNTRUSTED_TARGET_ORIGINS = {"homeassistant_local", "unknown"}
+
+
+def trusted_cached_route_value(cached_route: Dict[str, Any]) -> str:
+    """Cached target usable as "last_known_good". A value that originally came
+    from mDNS-resolving homeassistant.local is NOT trustworthy: on a LAN with
+    more than one HAOS device that name can point at a different Home Assistant,
+    and reusing it as "known good" pins the wrong target forever."""
+    origin = str(
+        cached_route.get("target_source_origin") or cached_route.get("target_source") or ""
+    ).strip().lower()
+    if origin in UNTRUSTED_TARGET_ORIGINS:
+        return ""
+    hostname = str(cached_route.get("target_hostname") or "").strip()
+    if hostname.lower() == AMBIGUOUS_TARGET_HOSTNAME:
+        # The hostname duplicates the final mDNS fallback; only the cached
+        # numeric IP could add value, but with an untrusted/unknown origin the
+        # IP is just the earlier mDNS answer, so skip it too.
+        hostname = ""
+    if hostname:
+        return hostname
+    if origin and origin != "last_known_good":
+        return str(cached_route.get("target_ip") or cached_route.get("target_host") or "").strip()
+    return ""
+
+
 def resolve_route_target(options: Dict[str, Any], state: Dict[str, Any]) -> Dict[str, Any]:
     explicit_value = str(options.get("home_assistant_target") or options.get("home_assistant_url") or "").strip()
     cached_route = dict(state.get("route") or {})
-    cached_value = str(cached_route.get("target_hostname") or cached_route.get("target_ip") or cached_route.get("target_host") or "").strip()
+    cached_value = trusted_cached_route_value(cached_route)
     try:
         supervisor_candidate, supervisor_error = select_supervisor_host_target()
     except Exception as exc:
@@ -2574,6 +2604,11 @@ def resolve_route_target(options: Dict[str, Any], state: Dict[str, Any]) -> Dict
         core_candidate, core_error = select_core_config_target()
     except Exception as exc:
         core_candidate, core_error = None, str(exc)
+    if supervisor_error:
+        # The Supervisor is the only authoritative source for this host's own
+        # LAN IP; when it fails the resolver may fall back to ambiguous sources,
+        # so make the reason visible in the logs.
+        LOG.info("route target supervisor_network unavailable error=%s", sanitize_error_text(supervisor_error))
 
     # Order matters: the first candidate that resolves is selected (see the loop
     # below). Prefer sources that describe THIS device's own Home Assistant --
@@ -2604,8 +2639,15 @@ def resolve_route_target(options: Dict[str, Any], state: Dict[str, Any]) -> Dict
             continue
         selected_ip = resolved_ips[0]
         reachable, reachability_error = tcp_target_reachable(selected_ip, HA_TARGET_DEFAULT_PORT)
+        if source == "last_known_good":
+            origin = str(
+                cached_route.get("target_source_origin") or cached_route.get("target_source") or "unknown"
+            ).strip().lower()
+        else:
+            origin = source
         selected = {
             "source": source,
+            "target_source_origin": origin,
             "configured_target": explicit_value or None,
             "target_host": candidate["host"],
             "target_hostname": candidate.get("target_hostname"),
@@ -2623,6 +2665,7 @@ def resolve_route_target(options: Dict[str, Any], state: Dict[str, Any]) -> Dict
             "effective_target_cidr": route_network_for_ip(selected_ip),
             "current_endpoint": route_url(str(candidate["scheme"] or "http"), selected_ip, HA_TARGET_DEFAULT_PORT),
             "host_lan_cidr": candidate.get("host_cidr"),
+            "target_resolution_errors": list(errors),
             "last_error": None if reachable else (reachability_error or "tcp_probe_failed"),
         }
         break
@@ -2640,12 +2683,14 @@ def resolve_route_target(options: Dict[str, Any], state: Dict[str, Any]) -> Dict
             "target_scheme": "http",
             "target_type": None,
             "target_source": None,
+            "target_source_origin": None,
             "local_tcp_8123_reachable": False,
             "health_status": "unresolved",
             "target_reachable": False,
             "route_network": None,
             "effective_target_cidr": None,
             "current_endpoint": None,
+            "target_resolution_errors": list(errors),
             "last_error": ";".join(errors[-4:]) if errors else "unresolved",
         }
 
@@ -2810,10 +2855,18 @@ def refresh_route_runtime_state(options: Optional[Dict[str, Any]] = None, status
     route_state = dict(state.get("route") or {})
     now = now_iso()
     legacy_proxy_url = None
-    if status and status.get("peer_ip"):
+    if status and status.get("peer_ip") and is_ip_address(str(status["peer_ip"])):
         legacy_proxy_url = route_url("http", str(status["peer_ip"]), PROXY_LISTEN_PORT)
     elif route_state.get("legacy_proxy_url"):
-        legacy_proxy_url = str(route_state.get("legacy_proxy_url"))
+        cached_proxy_url = str(route_state.get("legacy_proxy_url"))
+        try:
+            cached_proxy_host = urllib.parse.urlsplit(cached_proxy_url).hostname or ""
+        except Exception:
+            cached_proxy_host = ""
+        # Drop cached URLs whose host is not a real IP (e.g. error text like
+        # "TimeoutExpired:" that leaked into peer_ip in older builds).
+        if cached_proxy_host and is_ip_address(cached_proxy_host):
+            legacy_proxy_url = cached_proxy_url
     current_identity = (
         str(route_state.get("resolved_target_ip") or route_state.get("target_ip") or ""),
         int(route_state.get("target_port") or HA_TARGET_DEFAULT_PORT),
@@ -2976,6 +3029,8 @@ def refresh_route_runtime_state(options: Optional[Dict[str, Any]] = None, status
         "target_scheme": selected.get("target_scheme") or "http",
         "target_type": selected.get("target_type"),
         "target_source": selected.get("target_source"),
+        "target_source_origin": selected.get("target_source_origin"),
+        "target_resolution_errors": selected.get("target_resolution_errors") or [],
         "host_lan_cidr": selected.get("host_lan_cidr"),
         "local_tcp_8123_reachable": bool(selected.get("local_tcp_8123_reachable")),
         "health_status": health_status,
@@ -5211,9 +5266,24 @@ class HomeAssistantUpstreamResolver:
         self._last_error: Optional[str] = None
         self._load_cache()
 
+    @staticmethod
+    def _is_ambiguous_mdns_url(url: Optional[str]) -> bool:
+        """homeassistant.local is answered by EVERY HAOS device on the LAN, so a
+        URL derived from it must never be trusted as "last known good" — on a
+        shared LAN it can silently pin the proxy to a different Home Assistant."""
+        if not url:
+            return False
+        try:
+            host = urllib.parse.urlsplit(url).hostname or ""
+        except Exception:
+            return False
+        return host.strip().lower() == "homeassistant.local"
+
     def _load_cache(self) -> None:
         cached = read_json_file(self._cache_path, {})
         cached_url = normalize_base_url(str(cached.get("last_known_good_url") or ""))
+        if self._is_ambiguous_mdns_url(cached_url):
+            cached_url = None
         with self._lock:
             self._current_url = cached_url
             self._current_source = "last_known_good" if cached_url else None
@@ -5222,9 +5292,10 @@ class HomeAssistantUpstreamResolver:
         update_proxy_runtime_state(self._current_url, self._current_source, self._last_resolved_at, self._last_error)
 
     def _store_cache(self, url: Optional[str], source: Optional[str], resolved_at: Optional[str], error: Optional[str]) -> None:
+        ambiguous = self._is_ambiguous_mdns_url(url)
         payload = {
-            "last_known_good_url": url,
-            "last_known_good_source": source,
+            "last_known_good_url": None if ambiguous else url,
+            "last_known_good_source": None if ambiguous else source,
             "last_resolved_at": resolved_at,
             "last_error": error,
         }
@@ -5240,14 +5311,20 @@ class HomeAssistantUpstreamResolver:
 
         # Each HAOS add-on resolves its own upstream locally. Remote peers must target the
         # agent's NetBird IP on :8123; the upstream hostname is never the global routing key.
+        #
+        # Order matters: "homeassistant" is the Supervisor-internal DNS name and
+        # ALWAYS points at this host's own Core, so it must be probed before the
+        # mDNS name "homeassistant.local" — on a LAN with more than one HAOS
+        # device the mDNS name can resolve to a DIFFERENT Home Assistant, making
+        # the addon proxy a stranger's UI. mDNS is strictly a last resort.
         ordered: list[tuple[str, Optional[str]]] = [
             ("configured_env", configured_env),
             ("configured_option", configured_option),
-            ("homeassistant_local", normalize_base_url("http://homeassistant.local:8123")),
-            ("homeassistant_service", normalize_base_url("http://homeassistant:8123")),
             # Prefer direct Home Assistant service URLs for full frontend/auth proxying.
+            ("homeassistant_service", normalize_base_url("http://homeassistant:8123")),
             ("supervisor_core", normalize_base_url("http://supervisor/core")),
             ("last_known_good", cached),
+            ("homeassistant_local", normalize_base_url("http://homeassistant.local:8123")),
         ]
         deduped: list[tuple[str, str]] = []
         seen: set[str] = set()
@@ -5281,10 +5358,26 @@ class HomeAssistantUpstreamResolver:
 
         return False, f"{auth_detail};{frontend_detail}"
 
+    def _resolved_within(self, seconds: float) -> bool:
+        raw = self._last_resolved_at
+        if not raw:
+            return False
+        try:
+            resolved_at = datetime.fromisoformat(str(raw))
+        except Exception:
+            return False
+        if resolved_at.tzinfo is None:
+            resolved_at = resolved_at.replace(tzinfo=timezone.utc)
+        return (datetime.now(timezone.utc) - resolved_at).total_seconds() < seconds
+
     def resolve(self, force: bool = False, reason: str = "request") -> str:
         with self._lock:
             if self._current_url and not force:
-                return self._current_url
+                # An mDNS-selected upstream is provisional: keep re-probing the
+                # candidate list periodically so the unambiguous internal
+                # "homeassistant" service reclaims the upstream once healthy.
+                if not self._is_ambiguous_mdns_url(self._current_url) or self._resolved_within(300):
+                    return self._current_url
 
         last_error = "no_candidates"
         for source, candidate in self._candidate_urls():
@@ -5329,7 +5422,11 @@ class HomeAssistantUpstreamResolver:
             source = self._current_source if normalized == self._current_url else "last_known_good"
             self._current_url = normalized
             self._current_source = source
-            self._last_resolved_at = now_iso()
+            # Keep the original selection timestamp for the ambiguous mDNS
+            # upstream: refreshing it on every proxied request would postpone the
+            # periodic re-probe in resolve() indefinitely.
+            if not (self._is_ambiguous_mdns_url(normalized) and self._last_resolved_at):
+                self._last_resolved_at = now_iso()
             self._last_error = None
             self._store_cache(self._current_url, self._current_source, self._last_resolved_at, self._last_error)
 
@@ -5833,6 +5930,8 @@ document.addEventListener("DOMContentLoaded", () => {
       effective_target_hostname: s.route?.effective_target_hostname,
       routed_target_ip: s.route?.target_ip,
       routed_target_source: s.route?.target_source,
+      routed_target_source_origin: s.route?.target_source_origin,
+      target_resolution_errors: (s.route?.target_resolution_errors || []).join("; "),
       local_tcp_8123_reachable: s.route?.local_tcp_8123_reachable,
       health_status: s.route?.health_status,
       route_needs_report: s.route?.needs_report,
