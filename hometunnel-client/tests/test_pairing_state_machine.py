@@ -161,6 +161,124 @@ class PairingUiStaticTests(unittest.TestCase):
         self.assertNotIn("pillow", requirements)
 
 
+class TransportStateTests(unittest.TestCase):
+    def _base_state(self) -> dict:
+        return {
+            "device_id": "dev-1",
+            "home_id": "home-1",
+            "netbird": {},
+            "netbird_peer_id": None,
+            "binding": {},
+            "netbird_transport_degraded": False,
+        }
+
+    def test_transport_ready_accepts_overlay_ip_without_local_peer_id(self) -> None:
+        state = self._base_state()
+        state["netbird"] = {"connected": True, "peer_id": None, "peer_ip": "100.87.34.152"}
+        self.assertTrue(app.transport_ready_from_state(state))
+
+    def test_transport_ready_accepts_portal_peer_id(self) -> None:
+        state = self._base_state()
+        state["netbird"] = {"connected": True, "peer_id": None, "peer_ip": None}
+        state["netbird_peer_id"] = "d9ifbabg0fcc73fi0emg"
+        self.assertTrue(app.transport_ready_from_state(state))
+
+    def test_transport_not_ready_when_disconnected(self) -> None:
+        state = self._base_state()
+        state["netbird"] = {"connected": False, "peer_ip": "100.87.34.152"}
+        state["netbird_peer_id"] = "d9ifbabg0fcc73fi0emg"
+        self.assertFalse(app.transport_ready_from_state(state))
+
+    def test_display_peer_id_falls_back_to_portal_id(self) -> None:
+        state = self._base_state()
+        state["netbird"] = {"peer_id": None}
+        state["netbird_peer_id"] = "portal-peer-1"
+        self.assertEqual(app.display_peer_id_from_state(state), "portal-peer-1")
+
+    def test_healthy_device_reports_connected(self) -> None:
+        state = self._base_state()
+        state["netbird"] = {"connected": True, "peer_ip": "100.87.34.152"}
+        state["netbird_peer_id"] = "portal-peer-1"
+        state["binding"] = {"valid": True}
+        state["last_heartbeat_at"] = datetime.now(timezone.utc).isoformat()
+        state["transport_ready"] = app.transport_ready_from_state(state)
+        state["binding_ready"] = app.binding_ready_from_state(state)
+        state["paired"] = True
+        self.assertEqual(app.derive_pairing_state(state), "connected")
+
+    def test_transport_degraded_flag_forces_error_state(self) -> None:
+        state = self._base_state()
+        state["netbird"] = {"connected": True, "peer_ip": "100.87.34.152"}
+        state["netbird_peer_id"] = "portal-peer-1"
+        state["binding"] = {"valid": True}
+        state["last_heartbeat_at"] = datetime.now(timezone.utc).isoformat()
+        state["transport_ready"] = True
+        state["binding_ready"] = True
+        state["paired"] = True
+        state["netbird_transport_degraded"] = True
+        self.assertEqual(app.derive_pairing_state(state), "error")
+        status, _detail = app.derive_local_status(state)
+        self.assertEqual(status, "netbird_transport_degraded")
+
+    def test_management_connected_detects_degradation(self) -> None:
+        healthy = {"management": {"connected": True, "error": ""}}
+        self.assertIs(app.extract_netbird_management_connected(healthy), True)
+        degraded_flag = {"management": {"connected": False, "error": ""}}
+        self.assertIs(app.extract_netbird_management_connected(degraded_flag), False)
+        degraded_error = {"management": {"connected": True, "error": "rpc error: code = Internal"}}
+        self.assertIs(app.extract_netbird_management_connected(degraded_error), False)
+        unknown = {"peers": {}}
+        self.assertIsNone(app.extract_netbird_management_connected(unknown))
+
+    def test_management_degraded_marker_in_raw_text(self) -> None:
+        self.assertIs(
+            app.extract_netbird_management_connected({}, "management transport is up but the sync stream is unhealthy"),
+            False,
+        )
+
+
+class SupervisorHostTargetTests(unittest.TestCase):
+    def test_parses_address_list(self) -> None:
+        payload = {"address": ["192.168.68.151/24"], "gateway": "192.168.68.1"}
+        self.assertEqual(app.extract_supervisor_interface_ip(payload), "192.168.68.151")
+        self.assertEqual(app.supervisor_interface_cidr(payload), "192.168.68.151/24")
+
+    def test_falls_back_to_legacy_scalar(self) -> None:
+        payload = {"ip_address": "192.168.68.151/24"}
+        self.assertEqual(app.extract_supervisor_interface_ip(payload), "192.168.68.151")
+
+    def test_missing_address_returns_none(self) -> None:
+        self.assertIsNone(app.extract_supervisor_interface_ip({"address": []}))
+        self.assertIsNone(app.extract_supervisor_interface_ip({}))
+
+    def test_select_supervisor_host_target_uses_address_list(self) -> None:
+        network_info = {
+            "interfaces": [
+                {
+                    "interface": "enp0s1",
+                    "primary": True,
+                    "enabled": True,
+                    "connected": True,
+                    "ipv4": {"address": ["192.168.68.151/24"], "gateway": "192.168.68.1"},
+                    "ipv6": {},
+                }
+            ]
+        }
+        with patch.object(app, "supervisor_request_json", return_value=network_info):
+            candidate, error = app.select_supervisor_host_target()
+        self.assertIsNone(error)
+        self.assertIsNotNone(candidate)
+        self.assertEqual(candidate["host"], "192.168.68.151")
+        self.assertEqual(candidate["host_cidr"], "192.168.68.151/24")
+
+    def test_select_supervisor_host_target_missing_ip(self) -> None:
+        network_info = {"interfaces": [{"interface": "enp0s1", "enabled": True, "ipv4": {"address": []}}]}
+        with patch.object(app, "supervisor_request_json", return_value=network_info):
+            candidate, error = app.select_supervisor_host_target()
+        self.assertIsNone(candidate)
+        self.assertEqual(error, "no_primary_interface_ip")
+
+
 class PairingStateMachineTests(unittest.TestCase):
     def setUp(self) -> None:
         self.tmp = tempfile.TemporaryDirectory()

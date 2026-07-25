@@ -92,10 +92,17 @@ def _parse_ip_output(output: str) -> list[Dict[str, str]]:
         match = line_re.search(line.strip())
         if not match:
             continue
-        cidr = normalize_ipv4_cidr(match.group("cidr"))
+        raw_cidr = match.group("cidr")
+        cidr = normalize_ipv4_cidr(raw_cidr)
         if not cidr:
             continue
-        ip_text = str(ipaddress.ip_interface(cidr).ip)
+        # Derive the host address from the RAW CIDR: normalize_ipv4_cidr collapses
+        # to the network base (strict=False), so `ip_interface(cidr).ip` would be
+        # the network address (e.g. 172.30.32.0) rather than this host's address.
+        try:
+            ip_text = str(ipaddress.ip_interface(raw_cidr).ip)
+        except ValueError:
+            continue
         entries.append(
             {
                 "interface": match.group("ifname"),
@@ -234,9 +241,28 @@ def build_network_context(
     device_id: Optional[str] = None,
     home_id: Optional[str] = None,
     target_source: Optional[str] = None,
+    host_lan_cidr: Any = None,
 ) -> Dict[str, Any]:
-    local_addresses = _unique_strings(local_ipv4_addresses or [], normalize_ipv4_text)
-    local_subnets = _unique_strings(local_ipv4_subnets or [], normalize_ipv4_cidr)
+    # The addon container only has the Supervisor docker bridge and the NetBird
+    # overlay -- never the host's physical LAN. The host's own LAN CIDR (from
+    # Supervisor /network/info) is supplied so same-LAN/conflict detection can
+    # see the real network the target lives on.
+    host_lan_addresses: list[str] = []
+    host_lan_subnets: list[str] = []
+    host_lan_text = str(host_lan_cidr or "").strip()
+    if host_lan_text:
+        host_address = normalize_ipv4_text(host_lan_text)
+        if host_address:
+            host_lan_addresses.append(host_address)
+        host_subnet = normalize_ipv4_cidr(host_lan_text)
+        if host_subnet:
+            host_lan_subnets.append(host_subnet)
+    local_addresses = _unique_strings(
+        [*(local_ipv4_addresses or []), *host_lan_addresses], normalize_ipv4_text
+    )
+    local_subnets = _unique_strings(
+        [*(local_ipv4_subnets or []), *host_lan_subnets], normalize_ipv4_cidr
+    )
     selected_target_ip = normalize_ipv4_text(target_ip)
     selected_target_hostname = str(target_hostname or "").strip() or None
     routed_target_ip = normalize_ipv4_text(resolved_target_ip) or selected_target_ip

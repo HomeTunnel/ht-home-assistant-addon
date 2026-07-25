@@ -8,7 +8,11 @@ ROOT = pathlib.Path(__file__).resolve().parents[1] / "rootfs" / "opt" / "hometun
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from network_context import build_hometunnel_dns_hostname, build_network_context
+from network_context import (
+    _parse_ip_output,
+    build_hometunnel_dns_hostname,
+    build_network_context,
+)
 
 
 class NetworkContextTests(unittest.TestCase):
@@ -150,6 +154,48 @@ class NetworkContextTests(unittest.TestCase):
         self.assertEqual(context["hometunnel_dns_hostname"].count("."), 3)
         self.assertNotIn("@", context["hometunnel_dns_hostname"])
         self.assertNotIn(".io", context["hometunnel_dns_hostname"])
+
+
+class ParseIpOutputTests(unittest.TestCase):
+    def test_preserves_host_bits(self) -> None:
+        # `ip -o -4 addr show` style output. The address must be the host's own
+        # address, not the network base (regression: normalize-before-extract bug).
+        output = (
+            "2: eth0    inet 172.30.32.5/23 brd 172.30.33.255 scope global eth0\\n"
+            "3: wt0    inet 100.87.34.152/16 scope global wt0\\n"
+        ).replace("\\n", "\n")
+        entries = _parse_ip_output(output)
+        by_iface = {entry["interface"]: entry for entry in entries}
+        self.assertEqual(by_iface["eth0"]["address"], "172.30.32.5")
+        self.assertEqual(by_iface["eth0"]["cidr"], "172.30.32.0/23")
+        self.assertEqual(by_iface["wt0"]["address"], "100.87.34.152")
+        self.assertEqual(by_iface["wt0"]["cidr"], "100.87.0.0/16")
+
+
+class SupervisorHostLanTests(unittest.TestCase):
+    def test_host_lan_cidr_enables_conflict_detection(self) -> None:
+        # The container only sees the docker bridge + overlay; the host's LAN CIDR
+        # (from Supervisor /network/info) is what makes same-LAN detection work.
+        context = build_network_context(
+            local_ipv4_addresses=["172.30.32.5", "100.87.34.152"],
+            local_ipv4_subnets=["172.30.32.0/23", "100.87.0.0/16"],
+            target_ip="192.168.68.141",
+            host_lan_cidr="192.168.68.151/24",
+        )
+        self.assertTrue(context["same_lan_detected"])
+        self.assertTrue(context["subnet_overlap"])
+        self.assertFalse(context["exact_ip_conflict"])
+        self.assertIn("192.168.68.0/24", context["matching_local_subnets"])
+
+    def test_host_lan_cidr_detects_exact_conflict(self) -> None:
+        context = build_network_context(
+            local_ipv4_addresses=["172.30.32.5"],
+            local_ipv4_subnets=["172.30.32.0/23"],
+            target_ip="192.168.68.151",
+            host_lan_cidr="192.168.68.151/24",
+        )
+        self.assertTrue(context["exact_ip_conflict"])
+        self.assertEqual(context["network_status"], "exact_ip_conflict")
 
 
 if __name__ == "__main__":
