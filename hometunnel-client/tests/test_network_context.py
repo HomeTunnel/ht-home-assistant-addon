@@ -173,25 +173,40 @@ class ParseIpOutputTests(unittest.TestCase):
 
 
 class SupervisorHostLanTests(unittest.TestCase):
-    def test_host_lan_cidr_enables_conflict_detection(self) -> None:
-        # The container only sees the docker bridge + overlay; the host's LAN CIDR
-        # (from Supervisor /network/info) is what makes same-LAN detection work.
+    def test_host_lan_cidr_is_diagnostic_not_a_container_overlap(self) -> None:
+        # The Supervisor-selected HAOS address is the intended target. It is not
+        # an interface inside the addon container and must not be compared with
+        # itself as if another local peer owned it.
         context = build_network_context(
             local_ipv4_addresses=["172.30.32.5", "100.87.34.152"],
             local_ipv4_subnets=["172.30.32.0/23", "100.87.0.0/16"],
             target_ip="192.168.68.141",
             host_lan_cidr="192.168.68.151/24",
         )
-        self.assertTrue(context["same_lan_detected"])
-        self.assertTrue(context["subnet_overlap"])
+        self.assertFalse(context["same_lan_detected"])
+        self.assertFalse(context["subnet_overlap"])
         self.assertFalse(context["exact_ip_conflict"])
-        self.assertIn("192.168.68.0/24", context["matching_local_subnets"])
+        self.assertEqual(context["network_status"], "remote")
+        self.assertEqual(context["host_lan_address"], "192.168.68.151")
+        self.assertEqual(context["host_lan_subnet"], "192.168.68.0/24")
+        self.assertNotIn("192.168.68.0/24", context["local_ipv4_subnets"])
 
-    def test_host_lan_cidr_detects_exact_conflict(self) -> None:
+    def test_own_supervisor_target_is_not_an_exact_conflict(self) -> None:
         context = build_network_context(
             local_ipv4_addresses=["172.30.32.5"],
             local_ipv4_subnets=["172.30.32.0/23"],
             target_ip="192.168.68.151",
+            host_lan_cidr="192.168.68.151/24",
+        )
+        self.assertFalse(context["exact_ip_conflict"])
+        self.assertFalse(context["subnet_overlap"])
+        self.assertEqual(context["network_status"], "remote")
+
+    def test_real_container_interface_conflict_remains_detected(self) -> None:
+        context = build_network_context(
+            local_ipv4_addresses=["172.30.32.5", "100.87.34.152"],
+            local_ipv4_subnets=["172.30.32.0/23", "100.87.0.0/16"],
+            target_ip="100.87.34.152",
             host_lan_cidr="192.168.68.151/24",
         )
         self.assertTrue(context["exact_ip_conflict"])

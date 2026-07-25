@@ -1434,6 +1434,30 @@ class PairingStateMachineTests(unittest.TestCase):
         self.assertNotIn("signed-binding-secret", output)
         self.assertIn("***redacted***", output)
 
+    def test_uvicorn_access_redaction_preserves_formatter_arguments(self) -> None:
+        record = logging.LogRecord(
+            "uvicorn.access",
+            logging.INFO,
+            __file__,
+            1,
+            '%s - "%s %s HTTP/%s" %d',
+            ("172.30.32.2:12345", "GET", "/?token=secret-token-xyz", "1.1", 200),
+            None,
+        )
+
+        # The record factory and the uvicorn logger can each apply the filter.
+        app._redact_secrets_filter.filter(record)
+        app._redact_secrets_filter.filter(record)
+
+        self.assertEqual(len(record.args), 5)
+        client_addr, method, path, http_version, status_code = record.args
+        self.assertEqual(client_addr, "172.30.32.2:12345")
+        self.assertEqual(method, "GET")
+        self.assertEqual(http_version, "1.1")
+        self.assertEqual(status_code, 200)
+        self.assertIn("***redacted***", path)
+        self.assertNotIn("secret-token-xyz", path)
+
     def test_qr_code_dependency_removed(self) -> None:
         dependency = "qr" + "code"
         helper_name = "make_" + "qr" + "_data_url"

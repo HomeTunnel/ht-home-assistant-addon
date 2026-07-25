@@ -244,25 +244,18 @@ def build_network_context(
     host_lan_cidr: Any = None,
 ) -> Dict[str, Any]:
     # The addon container only has the Supervisor docker bridge and the NetBird
-    # overlay -- never the host's physical LAN. The host's own LAN CIDR (from
-    # Supervisor /network/info) is supplied so same-LAN/conflict detection can
-    # see the real network the target lives on.
-    host_lan_addresses: list[str] = []
-    host_lan_subnets: list[str] = []
+    # overlay -- never the host's physical LAN. Keep the authoritative HAOS LAN
+    # identity separate from the container interface collision set. Adding it to
+    # local_addresses/local_subnets compares the Supervisor-selected target with
+    # itself and falsely reports every own-host target as an IP conflict.
+    host_lan_address: Optional[str] = None
+    host_lan_subnet: Optional[str] = None
     host_lan_text = str(host_lan_cidr or "").strip()
     if host_lan_text:
-        host_address = normalize_ipv4_text(host_lan_text)
-        if host_address:
-            host_lan_addresses.append(host_address)
-        host_subnet = normalize_ipv4_cidr(host_lan_text)
-        if host_subnet:
-            host_lan_subnets.append(host_subnet)
-    local_addresses = _unique_strings(
-        [*(local_ipv4_addresses or []), *host_lan_addresses], normalize_ipv4_text
-    )
-    local_subnets = _unique_strings(
-        [*(local_ipv4_subnets or []), *host_lan_subnets], normalize_ipv4_cidr
-    )
+        host_lan_address = normalize_ipv4_text(host_lan_text)
+        host_lan_subnet = normalize_ipv4_cidr(host_lan_text)
+    local_addresses = _unique_strings(local_ipv4_addresses or [], normalize_ipv4_text)
+    local_subnets = _unique_strings(local_ipv4_subnets or [], normalize_ipv4_cidr)
     selected_target_ip = normalize_ipv4_text(target_ip)
     selected_target_hostname = str(target_hostname or "").strip() or None
     routed_target_ip = normalize_ipv4_text(resolved_target_ip) or selected_target_ip
@@ -310,6 +303,8 @@ def build_network_context(
     return {
         "local_ipv4_addresses": local_addresses,
         "local_ipv4_subnets": local_subnets,
+        "host_lan_address": host_lan_address,
+        "host_lan_subnet": host_lan_subnet,
         "selected_target_ip": selected_target_ip,
         "selected_target_hostname": selected_target_hostname,
         "resolved_target_ip": routed_target_ip,

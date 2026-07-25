@@ -238,6 +238,14 @@ class _RedactSecretsFilter(logging.Filter):
 
     def filter(self, record: logging.LogRecord) -> bool:
         try:
+            if record.name == "uvicorn.access":
+                # AccessFormatter derives client_addr/request_line/status_code
+                # from this five-item tuple. Eagerly formatting the message and
+                # clearing args corrupts that contract and raises on every
+                # request. Redact each structured value while preserving shape.
+                record.msg = self._redact_text(str(record.msg))
+                record.args = self._redact_value(record.args)
+                return True
             try:
                 message = record.getMessage()
             except Exception:
