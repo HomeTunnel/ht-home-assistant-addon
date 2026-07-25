@@ -279,6 +279,105 @@ class SupervisorHostTargetTests(unittest.TestCase):
         self.assertEqual(error, "no_primary_interface_ip")
 
 
+class SupervisorCapabilityTests(unittest.TestCase):
+    def test_capability_reports_missing_token_without_exposing_a_value(self) -> None:
+        with patch.dict(app.os.environ, {}, clear=True):
+            capability = app.supervisor_api_capability()
+        self.assertTrue(capability["declared"])
+        self.assertFalse(capability["received"])
+        self.assertFalse(capability["token_available"])
+        self.assertEqual(capability["status"], "token_missing")
+        self.assertEqual(
+            set(capability),
+            {"declared", "received", "token_available", "status"},
+        )
+
+    def test_capability_reports_received_token_without_exposing_it(self) -> None:
+        with patch.dict(app.os.environ, {"SUPERVISOR_TOKEN": "super-secret"}, clear=True):
+            capability = app.supervisor_api_capability()
+        self.assertTrue(capability["received"])
+        self.assertEqual(capability["status"], "available")
+        self.assertNotIn("super-secret", json.dumps(capability))
+
+
+class RouteTargetFailClosedTests(unittest.TestCase):
+    def test_missing_supervisor_token_never_evaluates_route_candidates(self) -> None:
+        with (
+            patch.dict(app.os.environ, {}, clear=True),
+            patch.object(app, "select_supervisor_host_target") as supervisor_target,
+            patch.object(app, "select_core_config_target") as core_target,
+            patch.object(app, "resolve_host_ips") as resolve_host,
+        ):
+            selected = app.resolve_route_target(
+                {"home_assistant_target": "192.168.68.151"},
+                {"route": {"target_ip": "192.168.68.141", "target_source_origin": "supervisor_network"}},
+            )
+        supervisor_target.assert_not_called()
+        core_target.assert_not_called()
+        resolve_host.assert_not_called()
+        self.assertEqual(selected["health_status"], "unresolved")
+        self.assertIsNone(selected["target_ip"])
+        self.assertIsNone(selected["route_network"])
+        self.assertIsNone(selected["effective_target_cidr"])
+        self.assertFalse(selected["supervisor_api_authenticated"])
+        self.assertIn("supervisor_network:SUPERVISOR_TOKEN missing", selected["target_resolution_errors"])
+
+    def test_supervisor_authentication_failure_discards_trusted_cache(self) -> None:
+        auth_error = urllib.error.HTTPError(
+            "http://supervisor/network/info", 401, "Unauthorized", {}, None
+        )
+        with (
+            patch.dict(app.os.environ, {"SUPERVISOR_TOKEN": "present"}, clear=True),
+            patch.object(app, "select_supervisor_host_target", side_effect=auth_error),
+            patch.object(app, "select_core_config_target") as core_target,
+            patch.object(app, "resolve_host_ips") as resolve_host,
+        ):
+            selected = app.resolve_route_target(
+                {},
+                {"route": {"target_ip": "192.168.68.141", "target_source_origin": "supervisor_network"}},
+            )
+        resolve_host.assert_not_called()
+        core_target.assert_not_called()
+        self.assertEqual(selected["health_status"], "unresolved")
+        self.assertIsNone(selected["target_ip"])
+        self.assertFalse(selected["supervisor_api_authenticated"])
+
+    def test_route_resolution_never_uses_homeassistant_local(self) -> None:
+        with (
+            patch.dict(app.os.environ, {"SUPERVISOR_TOKEN": "present"}, clear=True),
+            patch.object(app, "select_supervisor_host_target", return_value=(None, "no_primary_interface_ip")),
+            patch.object(app, "select_core_config_target", return_value=(None, "core_urls_missing")),
+            patch.object(app, "resolve_host_ips") as resolve_host,
+        ):
+            selected = app.resolve_route_target({}, {"route": {}})
+        resolve_host.assert_not_called()
+        self.assertEqual(selected["health_status"], "unresolved")
+        self.assertIsNone(selected["target_ip"])
+        self.assertNotIn("homeassistant_local", json.dumps(selected))
+
+    def test_authoritative_supervisor_target_produces_own_host_route(self) -> None:
+        candidate = {
+            "host": "192.168.68.151",
+            "port": 8123,
+            "scheme": "http",
+            "target_type": "ipv4",
+            "target_hostname": None,
+            "host_cidr": "192.168.68.151/24",
+        }
+        with (
+            patch.dict(app.os.environ, {"SUPERVISOR_TOKEN": "present"}, clear=True),
+            patch.object(app, "select_supervisor_host_target", return_value=(candidate, None)),
+            patch.object(app, "select_core_config_target", return_value=(None, "core_urls_missing")),
+            patch.object(app, "resolve_host_ips", return_value=["192.168.68.151"]),
+            patch.object(app, "tcp_target_reachable", return_value=(True, None)),
+        ):
+            selected = app.resolve_route_target({}, {"route": {}})
+        self.assertEqual(selected["target_source"], "supervisor_network")
+        self.assertEqual(selected["target_ip"], "192.168.68.151")
+        self.assertEqual(selected["route_network"], "192.168.68.151/32")
+        self.assertTrue(selected["supervisor_api_authenticated"])
+
+
 class RouteTargetCacheTrustTests(unittest.TestCase):
     def test_poisoned_mdns_cache_rejected(self) -> None:
         # The exact shape from the field: a cached homeassistant.local entry that
@@ -332,6 +431,15 @@ class HaProxyUpstreamResolverTests(unittest.TestCase):
         self.assertIn("homeassistant_service", order)
         self.assertIn("homeassistant_local", order)
         self.assertLess(order.index("homeassistant_service"), order.index("homeassistant_local"))
+
+    def test_rewrite_candidates_keep_mdns_as_last_resort(self) -> None:
+        with (
+            patch.dict(app.os.environ, {}, clear=True),
+            patch.object(app, "load_options", return_value={}),
+        ):
+            candidates = app.proxy_rewrite_candidate_bases(None)
+        self.assertIn("http://homeassistant:8123", candidates)
+        self.assertEqual(candidates[-1], "http://homeassistant.local:8123")
 
     def test_mdns_cache_is_not_loaded(self) -> None:
         resolver = self._resolver({"last_known_good_url": "http://homeassistant.local:8123"})

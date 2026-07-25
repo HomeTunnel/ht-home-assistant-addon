@@ -20,7 +20,7 @@ import urllib.request
 import uuid
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Iterable, Optional
 
 import httpx
 import uvicorn
@@ -73,6 +73,7 @@ PROXY_WRITE_TIMEOUT_SECONDS = float(os.environ.get("HA_PROXY_WRITE_TIMEOUT_SECON
 PROXY_WS_OPEN_TIMEOUT_SECONDS = float(os.environ.get("HA_PROXY_WS_OPEN_TIMEOUT_SECONDS") or "10")
 PROXY_WS_CLOSE_TIMEOUT_SECONDS = float(os.environ.get("HA_PROXY_WS_CLOSE_TIMEOUT_SECONDS") or "5")
 SUPERVISOR_URL = (os.environ.get("SUPERVISOR_URL") or "http://supervisor").rstrip("/")
+SUPERVISOR_API_DECLARED = True
 HA_TARGET_DEFAULT_PORT = int(os.environ.get("HA_TARGET_PORT") or "8123")
 TARGET_DISCOVERY_TIMEOUT_SECONDS = float(os.environ.get("HA_TARGET_DISCOVERY_TIMEOUT_SECONDS") or "3")
 TARGET_CHANGE_DEBOUNCE_SECONDS = float(os.environ.get("HA_TARGET_CHANGE_DEBOUNCE_SECONDS") or "15")
@@ -677,6 +678,9 @@ def default_state() -> Dict[str, Any]:
             "target_scheme": "http",
             "target_type": None,
             "target_source": None,
+            "target_source_origin": None,
+            "target_resolution_errors": [],
+            "supervisor_api_authenticated": None,
             "local_tcp_8123_reachable": False,
             "health_status": "unknown",
             "target_reachable": False,
@@ -2347,6 +2351,18 @@ def supervisor_headers() -> Dict[str, str]:
     return {"Authorization": f"Bearer {token}"} if token else {}
 
 
+def supervisor_api_capability() -> Dict[str, Any]:
+    """Safe runtime diagnostic for the Supervisor API capability declared by
+    config.yaml. Never expose the credential itself."""
+    token_available = bool(supervisor_headers())
+    return {
+        "declared": SUPERVISOR_API_DECLARED,
+        "token_available": token_available,
+        "received": token_available,
+        "status": "available" if token_available else "token_missing",
+    }
+
+
 def supervisor_request_json(path: str) -> Dict[str, Any]:
     headers = supervisor_headers()
     if not headers:
@@ -2567,6 +2583,10 @@ def select_core_config_target() -> tuple[Optional[Dict[str, Any]], Optional[str]
 
 AMBIGUOUS_TARGET_HOSTNAME = "homeassistant.local"
 UNTRUSTED_TARGET_ORIGINS = {"homeassistant_local", "unknown"}
+SUPERVISOR_AUTH_ERROR_RE = re.compile(
+    r"(?:SUPERVISOR_TOKEN missing|HTTP Error (?:401|403)|\bunauthorized\b|\bforbidden\b)",
+    re.IGNORECASE,
+)
 
 
 def trusted_cached_route_value(cached_route: Dict[str, Any]) -> str:
@@ -2581,9 +2601,8 @@ def trusted_cached_route_value(cached_route: Dict[str, Any]) -> str:
         return ""
     hostname = str(cached_route.get("target_hostname") or "").strip()
     if hostname.lower() == AMBIGUOUS_TARGET_HOSTNAME:
-        # The hostname duplicates the final mDNS fallback; only the cached
-        # numeric IP could add value, but with an untrusted/unknown origin the
-        # IP is just the earlier mDNS answer, so skip it too.
+        # Route discovery no longer has an mDNS fallback. Do not revive a value
+        # persisted by an older release; its numeric IP may be a neighbor's.
         hostname = ""
     if hostname:
         return hostname
@@ -2592,38 +2611,101 @@ def trusted_cached_route_value(cached_route: Dict[str, Any]) -> str:
     return ""
 
 
+def supervisor_authentication_failed(error: Any) -> bool:
+    return bool(SUPERVISOR_AUTH_ERROR_RE.search(str(error or "")))
+
+
+def unresolved_route_target(errors: Iterable[str], reason: str = "unresolved") -> Dict[str, Any]:
+    resolution_errors = [str(error) for error in errors if str(error).strip()]
+    return {
+        "configured_target": None,
+        "target_host": None,
+        "target_hostname": None,
+        "resolved_target_hostname": None,
+        "selected_target_ip": None,
+        "target_ip": None,
+        "resolved_target_ip": None,
+        "target_port": HA_TARGET_DEFAULT_PORT,
+        "target_scheme": "http",
+        "target_type": None,
+        "target_source": None,
+        "target_source_origin": None,
+        "supervisor_api_authenticated": False
+        if any(supervisor_authentication_failed(error) for error in resolution_errors)
+        else None,
+        "local_tcp_8123_reachable": False,
+        "health_status": "unresolved",
+        "target_reachable": False,
+        "route_network": None,
+        "effective_target_cidr": None,
+        "current_endpoint": None,
+        "target_resolution_errors": resolution_errors,
+        "last_error": ";".join(resolution_errors[-4:]) if resolution_errors else reason,
+    }
+
+
 def resolve_route_target(options: Dict[str, Any], state: Dict[str, Any]) -> Dict[str, Any]:
     explicit_value = str(options.get("home_assistant_target") or options.get("home_assistant_url") or "").strip()
     cached_route = dict(state.get("route") or {})
     cached_value = trusted_cached_route_value(cached_route)
+    if not supervisor_headers():
+        # The manifest declares Supervisor API access. If the corresponding
+        # credential was not injected, this container does not satisfy that
+        # contract. Never substitute shared LAN mDNS for an authoritative host
+        # identity: doing so can advertise another HAOS device's address.
+        return unresolved_route_target(
+            [
+                "configured_target:not_evaluated_without_supervisor_auth",
+                "supervisor_network:SUPERVISOR_TOKEN missing",
+                "core_config:not_evaluated_without_supervisor_auth",
+                "last_known_good:not_evaluated_without_supervisor_auth",
+            ],
+            reason="supervisor_authentication_required",
+        )
     try:
         supervisor_candidate, supervisor_error = select_supervisor_host_target()
     except Exception as exc:
         supervisor_candidate, supervisor_error = None, str(exc)
+    supervisor_api_authenticated: Optional[bool]
+    if supervisor_candidate is not None or supervisor_error in {
+        "network_interfaces_missing",
+        "no_primary_interface_ip",
+    }:
+        supervisor_api_authenticated = True
+    else:
+        supervisor_api_authenticated = None
+    if supervisor_error:
+        # The Supervisor is the only authoritative source for this host's own
+        # LAN IP; make any fallback to explicit or trusted cached configuration
+        # visible in diagnostics.
+        LOG.info("route target supervisor_network unavailable error=%s", sanitize_error_text(supervisor_error))
+    if supervisor_authentication_failed(supervisor_error):
+        return unresolved_route_target(
+            [
+                "configured_target:not_evaluated_after_supervisor_auth_failure",
+                f"supervisor_network:{supervisor_error}",
+                "core_config:not_evaluated_after_supervisor_auth_failure",
+                "last_known_good:not_evaluated_after_supervisor_auth_failure",
+            ],
+            reason="supervisor_authentication_failed",
+        )
     try:
         core_candidate, core_error = select_core_config_target()
     except Exception as exc:
         core_candidate, core_error = None, str(exc)
-    if supervisor_error:
-        # The Supervisor is the only authoritative source for this host's own
-        # LAN IP; when it fails the resolver may fall back to ambiguous sources,
-        # so make the reason visible in the logs.
-        LOG.info("route target supervisor_network unavailable error=%s", sanitize_error_text(supervisor_error))
 
     # Order matters: the first candidate that resolves is selected (see the loop
     # below). Prefer sources that describe THIS device's own Home Assistant --
     # explicit config, then the Supervisor's own primary interface, then Core's
-    # configured URL -- before falling back to cached state or the shared
-    # "homeassistant.local" mDNS name. That generic name is NOT unique: on a LAN
-    # with more than one HAOS device it can resolve to a *different* device, which
-    # would make this addon target the wrong Home Assistant. It must therefore
-    # only ever be a last resort, never win over the local device's own address.
+    # configured URL -- before falling back to trusted cached state. The shared
+    # "homeassistant.local" mDNS name is intentionally forbidden here: on a LAN
+    # with multiple HAOS devices it can resolve to a different device. It remains
+    # available only to the local HA proxy, never as a route/CIDR source.
     candidates: list[tuple[str, Optional[Dict[str, Any]], Optional[str]]] = [
         ("configured_target", parse_target_input(explicit_value), None if explicit_value else "not_configured"),
         ("supervisor_network", supervisor_candidate, supervisor_error),
         ("core_config", core_candidate, core_error),
         ("last_known_good", parse_target_input(cached_value), None if cached_value else "no_cached_target"),
-        ("homeassistant_local", parse_target_input("http://homeassistant.local:8123"), None),
     ]
 
     errors: list[str] = []
@@ -2648,6 +2730,7 @@ def resolve_route_target(options: Dict[str, Any], state: Dict[str, Any]) -> Dict
         selected = {
             "source": source,
             "target_source_origin": origin,
+            "supervisor_api_authenticated": supervisor_api_authenticated,
             "configured_target": explicit_value or None,
             "target_host": candidate["host"],
             "target_hostname": candidate.get("target_hostname"),
@@ -2671,28 +2754,10 @@ def resolve_route_target(options: Dict[str, Any], state: Dict[str, Any]) -> Dict
         break
 
     if selected is None:
-        return {
-            "configured_target": explicit_value or None,
-            "target_host": None,
-            "target_hostname": None,
-            "resolved_target_hostname": None,
-            "selected_target_ip": None,
-            "target_ip": None,
-            "resolved_target_ip": None,
-            "target_port": HA_TARGET_DEFAULT_PORT,
-            "target_scheme": "http",
-            "target_type": None,
-            "target_source": None,
-            "target_source_origin": None,
-            "local_tcp_8123_reachable": False,
-            "health_status": "unresolved",
-            "target_reachable": False,
-            "route_network": None,
-            "effective_target_cidr": None,
-            "current_endpoint": None,
-            "target_resolution_errors": list(errors),
-            "last_error": ";".join(errors[-4:]) if errors else "unresolved",
-        }
+        unresolved = unresolved_route_target(errors)
+        unresolved["configured_target"] = explicit_value or None
+        unresolved["supervisor_api_authenticated"] = supervisor_api_authenticated
+        return unresolved
 
     selected["target_source"] = selected.pop("source")
     return selected
@@ -3031,6 +3096,7 @@ def refresh_route_runtime_state(options: Optional[Dict[str, Any]] = None, status
         "target_source": selected.get("target_source"),
         "target_source_origin": selected.get("target_source_origin"),
         "target_resolution_errors": selected.get("target_resolution_errors") or [],
+        "supervisor_api_authenticated": selected.get("supervisor_api_authenticated"),
         "host_lan_cidr": selected.get("host_lan_cidr"),
         "local_tcp_8123_reachable": bool(selected.get("local_tcp_8123_reachable")),
         "health_status": health_status,
@@ -3708,6 +3774,7 @@ def status_view_from_state(state: Dict[str, Any], options: Optional[Dict[str, An
         and current.get("device_token")
     )
     current["binding"] = normalize_binding_state(current)
+    current["supervisor_api"] = supervisor_api_capability()
     apply_pairing_session_to_state(current, normalize_pairing_session_state(current))
     current["route"] = {
         **dict(current.get("route") or {}),
@@ -5208,8 +5275,10 @@ def proxy_rewrite_candidate_bases(current_upstream: Optional[str]) -> list[str]:
         normalize_base_url(os.environ.get("HOME_ASSISTANT_URL", "")),
         normalize_base_url(str(options.get("home_assistant_url") or "")),
         normalize_base_url("http://supervisor/core"),
-        normalize_base_url("http://homeassistant.local:8123"),
         normalize_base_url("http://homeassistant:8123"),
+        # Shared LAN mDNS is an optional proxy-only last resort. It is never
+        # eligible for route-target/CIDR discovery.
+        normalize_base_url("http://homeassistant.local:8123"),
     ]
     deduped: list[str] = []
     seen: set[str] = set()
@@ -5932,6 +6001,11 @@ document.addEventListener("DOMContentLoaded", () => {
       routed_target_source: s.route?.target_source,
       routed_target_source_origin: s.route?.target_source_origin,
       target_resolution_errors: (s.route?.target_resolution_errors || []).join("; "),
+      supervisor_api_declared: s.supervisor_api?.declared,
+      supervisor_api_token_available: s.supervisor_api?.token_available,
+      supervisor_api_received: s.supervisor_api?.received,
+      supervisor_api_status: s.supervisor_api?.status,
+      supervisor_api_authenticated: s.route?.supervisor_api_authenticated,
       local_tcp_8123_reachable: s.route?.local_tcp_8123_reachable,
       health_status: s.route?.health_status,
       route_needs_report: s.route?.needs_report,
@@ -6213,6 +6287,14 @@ document.addEventListener("DOMContentLoaded", () => {
 @app.on_event("startup")
 def startup_event() -> None:
     install_uvicorn_log_redaction()
+    capability = supervisor_api_capability()
+    log_method = LOG.info if capability["received"] else LOG.error
+    log_method(
+        "supervisor api capability declared=%s received=%s status=%s",
+        capability["declared"],
+        capability["received"],
+        capability["status"],
+    )
     load_state()
     persist_runtime_observations(load_options())
     start_netbird_agent_if_needed()
@@ -6228,7 +6310,7 @@ def shutdown_event() -> None:
 
 @app.get("/health")
 def health() -> Dict[str, Any]:
-    return {"ok": True}
+    return {"ok": True, "supervisor_api": supervisor_api_capability()}
 
 
 @app.get("/api/ping")
@@ -6283,6 +6365,7 @@ def api_route_status() -> Dict[str, Any]:
     route_state = dict(state_copy.get("route") or {})
     return {
         "ok": True,
+        "supervisor_api": state_copy.get("supervisor_api") or supervisor_api_capability(),
         "transport_ready": bool(state_copy.get("transport_ready")),
         "binding_ready": bool(state_copy.get("binding_ready")),
         "access_mode": route_state.get("access_mode"),
@@ -6303,6 +6386,9 @@ def api_route_status() -> Dict[str, Any]:
         "resolved_target_ip": route_state.get("resolved_target_ip") or route_state.get("target_ip"),
         "target_port": route_state.get("target_port"),
         "target_source": route_state.get("target_source"),
+        "target_source_origin": route_state.get("target_source_origin"),
+        "target_resolution_errors": route_state.get("target_resolution_errors") or [],
+        "supervisor_api_authenticated": route_state.get("supervisor_api_authenticated"),
         "target_reachable": route_state.get("target_reachable"),
         "local_tcp_8123_reachable": route_state.get("local_tcp_8123_reachable"),
         "health_status": route_state.get("health_status"),

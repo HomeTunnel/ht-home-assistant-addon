@@ -31,6 +31,12 @@ class DnsModeConfigTests(unittest.TestCase):
         self.assertNotIn("dns_mode", config)
         self.assertNotIn("auto_dns", config)
 
+    def test_config_yaml_uses_least_privilege_supervisor_api_access(self) -> None:
+        config = CONFIG_PATH.read_text(encoding="utf-8")
+        self.assertIn("homeassistant_api: true", config)
+        self.assertIn("hassio_api: true", config)
+        self.assertNotIn("hassio_role:", config)
+
     def test_missing_dns_mode_normalizes_to_off(self) -> None:
         self.assertEqual(app.normalize_dns_mode(None), "off")
         self.assertEqual(app.load_options()["dns_mode"], "off")

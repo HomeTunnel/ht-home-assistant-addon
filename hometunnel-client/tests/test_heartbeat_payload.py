@@ -13,6 +13,42 @@ from network_context import build_hometunnel_dns_hostname
 
 
 class HeartbeatPayloadTests(unittest.TestCase):
+    def test_unresolved_authoritative_target_cannot_advertise_or_create_route(self) -> None:
+        status = {
+            "connected": True,
+            "peer_ip": "100.64.0.10",
+            "peer_name": "haos-peer",
+        }
+        state = {
+            "device_id": "device-123",
+            "home_id": "home-456",
+            "netbird_peer_id": "nb-management-peer-123",
+            "route": {
+                "ha_access_mode": "direct_ip",
+                "health_status": "unresolved",
+                "healthy": False,
+                "target_ip": None,
+                "resolved_target_ip": None,
+                "target_hostname": None,
+                "target_source": None,
+                "route_network": None,
+                "desired_advertise_routes": None,
+                "effective_target_cidr": None,
+            },
+        }
+
+        payload = build_heartbeat_payload(status, state)
+
+        self.assertFalse(payload["peer"]["routingPeerCapable"])
+        self.assertIsNone(payload["ha"]["targetIp"])
+        self.assertIsNone(payload["target"]["targetIp"])
+        self.assertIsNone(payload["target"]["effectiveTargetCidr"])
+        self.assertIsNone(payload["targetObservation"]["observedTargetIp"])
+        self.assertIsNone(payload["targetObservation"]["observedTargetCidr"])
+        self.assertIsNone(payload["route"]["routeNetwork"])
+        self.assertIsNone(payload["route"]["desiredAdvertiseRoutes"])
+        self.assertFalse(payload["route"]["routeHealthy"])
+
     def test_minimal_payload_shape_direct_ip(self) -> None:
         status = {
             "connected": True,
