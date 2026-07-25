@@ -280,6 +280,36 @@ class SupervisorHostTargetTests(unittest.TestCase):
 
 
 class SupervisorCapabilityTests(unittest.TestCase):
+    def test_supervisor_request_unwraps_native_api_response(self) -> None:
+        response = {
+            "result": "ok",
+            "data": {"interfaces": [{"interface": "enp0s1"}]},
+        }
+        with (
+            patch.dict(app.os.environ, {"SUPERVISOR_TOKEN": "present"}, clear=True),
+            patch.object(app, "request_json", return_value=response),
+        ):
+            payload = app.supervisor_request_json("/network/info")
+        self.assertEqual(payload, response["data"])
+
+    def test_supervisor_request_preserves_direct_core_proxy_response(self) -> None:
+        response = {"internal_url": "http://192.168.68.151:8123"}
+        with (
+            patch.dict(app.os.environ, {"SUPERVISOR_TOKEN": "present"}, clear=True),
+            patch.object(app, "request_json", return_value=response),
+        ):
+            payload = app.supervisor_request_json("/core/api/config")
+        self.assertEqual(payload, response)
+
+    def test_supervisor_request_rejects_error_envelope(self) -> None:
+        response = {"result": "error", "message": "network unavailable"}
+        with (
+            patch.dict(app.os.environ, {"SUPERVISOR_TOKEN": "present"}, clear=True),
+            patch.object(app, "request_json", return_value=response),
+            self.assertRaisesRegex(RuntimeError, "network unavailable"),
+        ):
+            app.supervisor_request_json("/network/info")
+
     def test_capability_reports_missing_token_without_exposing_a_value(self) -> None:
         with patch.dict(app.os.environ, {}, clear=True):
             capability = app.supervisor_api_capability()
