@@ -55,6 +55,9 @@ NETBIRD_RETRY_MAX_SECONDS = 300
 NETBIRD_UP_DEBOUNCE_SECONDS = 5
 NETBIRD_READY_TIMEOUT_SECONDS = 20
 NETBIRD_STATUS_CACHE_SECONDS = float(os.environ.get("NETBIRD_STATUS_CACHE_SECONDS") or "5")
+# Consecutive agent-loop polls with a degraded management/Sync channel before the
+# UI surfaces a hard transport failure (at POLL_INTERVAL_SECONDS ≈ 2+ minutes).
+NETBIRD_TRANSPORT_DEGRADED_THRESHOLD = int(os.environ.get("NETBIRD_TRANSPORT_DEGRADED_THRESHOLD") or "3")
 ROUTE_REFRESH_CACHE_SECONDS = float(os.environ.get("ROUTE_REFRESH_CACHE_SECONDS") or "5")
 PAIRING_SESSION_TTL_SECONDS = int(os.environ.get("PAIRING_SESSION_TTL_SECONDS") or "600")
 HEARTBEAT_UNCHANGED_MIN_SECONDS = float(os.environ.get("HEARTBEAT_UNCHANGED_MIN_SECONDS") or "90")
@@ -639,8 +642,10 @@ def default_state() -> Dict[str, Any]:
         "last_health_report_error": None,
         "portal_base_url": None,
         "last_error": None,
+        "netbird_transport_degraded": False,
         "netbird": {
             "connected": False,
+            "management_connected": None,
             "peer_id": None,
             "wireguard_public_key": None,
             "peer_ip": None,
@@ -772,6 +777,7 @@ LOCAL_STATUS_MESSAGES = {
     "heartbeat_healthy": "Heartbeat is healthy.",
     "peer_id_missing": "NetBird peer id is missing; heartbeat is not sent.",
     "netbird_management_peer_id_missing": "Portal has not linked the NetBird management peer yet; heartbeat is not sent.",
+    "netbird_transport_degraded": "NetBird can't keep a healthy connection to the server (the management Sync stream keeps failing). If this persists, reset pairing and pair this device again.",
     "missing_binding_id": "Binding id is missing; heartbeat is not sent. Re-pair is required.",
     "binding_material_missing": "Binding material is incomplete; re-pair is required.",
     "stale_binding": "The stored binding is stale. Re-pair is required.",
@@ -1009,7 +1015,10 @@ def derive_local_status(state: Dict[str, Any]) -> tuple[str, str]:
     if recovery_state == "corrupted_state_reset":
         return recovery_state, LOCAL_STATUS_MESSAGES["corrupted_state_reset"]
 
-    for candidate in (heartbeat_error, health_report_error, last_error, portal_validation_error):
+    # A sustained NetBird transport failure is surfaced via a dedicated flag so a
+    # heartbeat success (which clears last_error) cannot silently mask it.
+    degraded_marker = "netbird_transport_degraded" if bool(state.get("netbird_transport_degraded")) else None
+    for candidate in (heartbeat_error, health_report_error, last_error, portal_validation_error, degraded_marker):
         if candidate == "heartbeat_auth_failed":
             return "portal_trust_degraded", LOCAL_STATUS_MESSAGES["portal_trust_degraded"]
         if candidate == "binding_token_stale":
@@ -1040,6 +1049,8 @@ def derive_local_status(state: Dict[str, Any]) -> tuple[str, str]:
             return "peer_id_missing", LOCAL_STATUS_MESSAGES["peer_id_missing"]
         if candidate == "netbird_management_peer_id_missing":
             return "netbird_management_peer_id_missing", LOCAL_STATUS_MESSAGES["netbird_management_peer_id_missing"]
+        if candidate == "netbird_transport_degraded":
+            return "netbird_transport_degraded", LOCAL_STATUS_MESSAGES["netbird_transport_degraded"]
         if candidate == "missing_binding_id":
             return "missing_binding_id", LOCAL_STATUS_MESSAGES["missing_binding_id"]
         if candidate in {"peer_identity_mismatch", "binding_peer_mismatch"}:
@@ -1095,7 +1106,12 @@ def derive_pairing_state(state: Dict[str, Any]) -> str:
     binding_ready = bool(state.get("binding_ready"))
     paired = bool(state.get("paired"))
 
-    if recovery_state or pairing_status == "error" or last_error in {"re_pair_required", "state_file_corrupted"}:
+    if (
+        recovery_state
+        or pairing_status == "error"
+        or last_error in {"re_pair_required", "state_file_corrupted", "netbird_transport_degraded"}
+        or bool(state.get("netbird_transport_degraded"))
+    ):
         return "error"
     if transport_ready and binding_ready and normalize_optional_string(state.get("last_heartbeat_at")):
         return "connected"
@@ -1660,6 +1676,61 @@ def extract_netbird_connected(parsed: Dict[str, Any], self_peer: Dict[str, Optio
     return False
 
 
+# Raw-text markers emitted by the NetBird client when the management Sync stream
+# keeps failing (e.g. the peer was deleted server-side). These do not clear the
+# WireGuard tunnel, so `connected` can still read True while management is dead.
+NETBIRD_MANAGEMENT_DEGRADED_MARKERS = (
+    "sync stream is unhealthy",
+    "disconnected from the management service",
+    "failed handling request",
+)
+
+
+def extract_netbird_management_connected(
+    parsed: Dict[str, Any], text_hint: str = ""
+) -> Optional[bool]:
+    """Tri-state health of the management/Sync channel, independent of the
+    WireGuard tunnel: True=healthy, False=degraded/down, None=unknown."""
+    positive_markers = ("connected", "ready", "online", "active", "healthy")
+    negative_markers = ("disconnected", "disconnecting", "offline", "stopped", "error", "failed", "unhealthy")
+    result: Optional[bool] = None
+    for source in netbird_peer_sources(parsed):
+        for key in ("management", "managementState", "management_state", "management_connection_state", "managementConnectionState"):
+            value = source.get(key) if isinstance(source, dict) else None
+            if isinstance(value, dict):
+                # NetBird's `status --json` reports {"connected": bool, "error": str}.
+                # A non-empty error means the Sync stream is failing even if a
+                # stale "connected" still reads true.
+                if normalize_optional_string(value.get("error") or value.get("Error")):
+                    return False
+                direct = first_present(value, "connected", "isConnected", "online")
+                if direct is not None:
+                    result = bool(direct)
+                    if result is False:
+                        return False
+                state_text = first_present_string(value, "state", "status", "connectionState", "connection_state")
+                if state_text:
+                    lowered = state_text.lower()
+                    if any(marker in lowered for marker in negative_markers):
+                        return False
+                    if any(marker in lowered for marker in positive_markers) and result is None:
+                        result = True
+            elif isinstance(value, str) and value.strip():
+                lowered = value.lower()
+                if any(marker in lowered for marker in negative_markers):
+                    return False
+                if any(marker in lowered for marker in positive_markers) and result is None:
+                    result = True
+            elif isinstance(value, bool):
+                result = value
+                if result is False:
+                    return False
+    hint = text_hint.lower()
+    if any(marker in hint for marker in NETBIRD_MANAGEMENT_DEGRADED_MARKERS):
+        return False
+    return result
+
+
 def invalidate_runtime_caches(reason: str) -> None:
     with _netbird_status_lock:
         _netbird_status_cache["value"] = None
@@ -1686,6 +1757,7 @@ def collect_netbird_status() -> Dict[str, Any]:
     if not netbird_binary_path():
         value = {
             "connected": False,
+            "management_connected": None,
             "peer_id": None,
             "wireguard_public_key": None,
             "peer_ip": None,
@@ -1704,6 +1776,7 @@ def collect_netbird_status() -> Dict[str, Any]:
             raw_text = stable_json_dumps(parsed if isinstance(parsed, dict) else {"raw": parsed})
             self_peer = extract_netbird_self_peer(parsed if isinstance(parsed, dict) else {})
             connected = extract_netbird_connected(parsed if isinstance(parsed, dict) else {}, self_peer, raw_text)
+            management_connected = extract_netbird_management_connected(parsed if isinstance(parsed, dict) else {}, raw_text)
             remote_peers = extract_connected_remote_peers(parsed if isinstance(parsed, dict) else {}, self_peer) if isinstance(parsed, dict) else []
             LOG.debug(
                 "netbird self identity connected=%s peer_id=%s peer_name=%s peer_ip=%s connected_remote_peers=%s",
@@ -1715,6 +1788,7 @@ def collect_netbird_status() -> Dict[str, Any]:
             )
             value = {
                 "connected": connected,
+                "management_connected": management_connected,
                 "peer_id": self_peer.get("peer_id"),
                 "wireguard_public_key": self_peer.get("wireguard_public_key"),
                 "peer_ip": self_peer.get("peer_ip"),
@@ -1737,6 +1811,7 @@ def collect_netbird_status() -> Dict[str, Any]:
         or ("management service" in lowered_text and "connected" in lowered_text)
         or ("connected" in lowered_text and "disconnected" not in lowered_text)
     )
+    management_connected = extract_netbird_management_connected({}, lowered_text)
     peer_ip = None
     for token in text.replace(",", " ").split():
         normalized = normalize_netbird_ip(token)
@@ -1750,7 +1825,7 @@ def collect_netbird_status() -> Dict[str, Any]:
         peer_ip or "<unknown>",
         [],
     )
-    value = {"connected": connected, "peer_id": None, "wireguard_public_key": None, "peer_ip": peer_ip, "peer_name": None, "remote_peers": [], "raw": text}
+    value = {"connected": connected, "management_connected": management_connected, "peer_id": None, "wireguard_public_key": None, "peer_ip": peer_ip, "peer_name": None, "remote_peers": [], "raw": text}
     with _netbird_status_lock:
         _netbird_status_cache["value"] = clone_json(value)
         _netbird_status_cache["at"] = now_monotonic
@@ -2406,6 +2481,7 @@ def route_network_context(
         device_id=normalize_optional_string(state.get("device_id")),
         home_id=normalize_optional_string(state.get("home_id")),
         target_source=route_state.get("target_source"),
+        host_lan_cidr=route_state.get("host_lan_cidr"),
     )
     network.update(
         {
@@ -2415,6 +2491,31 @@ def route_network_context(
         }
     )
     return network
+
+
+def supervisor_interface_cidr(payload: Any) -> Optional[str]:
+    """First usable CIDR from a Supervisor /network/info interface's ipv4/ipv6
+    block. The real schema exposes `address` as a list of CIDR strings (e.g.
+    ["192.168.68.151/24"]); older/alternate shapes used a scalar `ip_address`."""
+    if not isinstance(payload, dict):
+        return None
+    candidates: list[Any] = []
+    address = payload.get("address")
+    if isinstance(address, list):
+        candidates.extend(address)
+    elif address:
+        candidates.append(address)
+    candidates.append(payload.get("ip_address"))
+    for candidate in candidates:
+        raw = str(candidate or "").strip()
+        if raw and extract_ip_from_cidr(raw):
+            return raw
+    return None
+
+
+def extract_supervisor_interface_ip(payload: Any) -> Optional[str]:
+    cidr = supervisor_interface_cidr(payload)
+    return extract_ip_from_cidr(cidr) if cidr else None
 
 
 def select_supervisor_host_target() -> tuple[Optional[Dict[str, Any]], Optional[str]]:
@@ -2433,7 +2534,7 @@ def select_supervisor_host_target() -> tuple[Optional[Dict[str, Any]], Optional[
         ipv4 = item.get("ipv4") if isinstance(item.get("ipv4"), dict) else {}
         ipv6 = item.get("ipv6") if isinstance(item.get("ipv6"), dict) else {}
         for family, payload in (("ipv4", ipv4), ("ipv6", ipv6)):
-            ip_value = extract_ip_from_cidr(payload.get("ip_address")) if isinstance(payload, dict) else None
+            ip_value = extract_supervisor_interface_ip(payload) if isinstance(payload, dict) else None
             if not ip_value or not is_valid_route_target_ip(ip_value):
                 continue
             return (
@@ -2444,6 +2545,7 @@ def select_supervisor_host_target() -> tuple[Optional[Dict[str, Any]], Optional[
                     "scheme": scheme,
                     "target_type": family,
                     "target_hostname": None,
+                    "host_cidr": supervisor_interface_cidr(payload),
                 },
                 None,
             )
@@ -2520,6 +2622,7 @@ def resolve_route_target(options: Dict[str, Any], state: Dict[str, Any]) -> Dict
             "route_network": route_network_for_ip(selected_ip),
             "effective_target_cidr": route_network_for_ip(selected_ip),
             "current_endpoint": route_url(str(candidate["scheme"] or "http"), selected_ip, HA_TARGET_DEFAULT_PORT),
+            "host_lan_cidr": candidate.get("host_cidr"),
             "last_error": None if reachable else (reachability_error or "tcp_probe_failed"),
         }
         break
@@ -2873,6 +2976,7 @@ def refresh_route_runtime_state(options: Optional[Dict[str, Any]] = None, status
         "target_scheme": selected.get("target_scheme") or "http",
         "target_type": selected.get("target_type"),
         "target_source": selected.get("target_source"),
+        "host_lan_cidr": selected.get("host_lan_cidr"),
         "local_tcp_8123_reachable": bool(selected.get("local_tcp_8123_reachable")),
         "health_status": health_status,
         "target_reachable": bool(selected.get("target_reachable")),
@@ -3509,7 +3613,27 @@ PORTAL_HARD_BINDING_INVALIDATION_CODES = {
 
 def transport_ready_from_state(state: Dict[str, Any]) -> bool:
     netbird = dict(state.get("netbird") or {})
-    return bool(netbird.get("connected")) and bool(normalize_optional_string(netbird.get("peer_id")))
+    if not netbird.get("connected"):
+        return False
+    # NetBird's `status --json` rarely exposes the local self-peer id, so also
+    # accept an assigned overlay IP or the portal-linked management peer id as
+    # proof that transport is up. Otherwise a fully healthy, heartbeating device
+    # would report transport_ready=false forever.
+    return bool(
+        normalize_optional_string(netbird.get("peer_id"))
+        or normalize_optional_string(netbird.get("peer_ip"))
+        or normalize_optional_string(state.get("netbird_peer_id"))
+    )
+
+
+def display_peer_id_from_state(state: Dict[str, Any]) -> Optional[str]:
+    """Peer id to show in the UI/status: prefer the local self-peer id, but fall
+    back to the portal-linked management peer id (which is what actually arrives
+    on modern NetBird) so the field is not perpetually blank."""
+    netbird = dict(state.get("netbird") or {})
+    return normalize_optional_string(netbird.get("peer_id")) or normalize_optional_string(
+        state.get("netbird_peer_id")
+    )
 
 
 def binding_ready_from_state(state: Dict[str, Any]) -> bool:
@@ -4737,6 +4861,7 @@ def netbird_agent_loop() -> int:
 
     backoff_seconds = NETBIRD_RETRY_MIN_SECONDS
     last_netbird_up_attempt_at = 0.0
+    degraded_polls = 0
     try:
         while True:
             state = read_json_file(STATE_PATH, default_state())
@@ -4760,6 +4885,25 @@ def netbird_agent_loop() -> int:
                 write_json_file(STATE_PATH, state)
             route_state = refresh_route_runtime_state(options, status)
             state = read_json_file(STATE_PATH, default_state())
+
+            # Track sustained management/Sync failures independently of the
+            # WireGuard tunnel and the portal heartbeat (which travels over HTTPS,
+            # not the overlay, so it can succeed while the overlay is broken).
+            if status.get("management_connected") is False:
+                degraded_polls += 1
+            else:
+                degraded_polls = 0
+            degraded_active = degraded_polls >= NETBIRD_TRANSPORT_DEGRADED_THRESHOLD
+            if bool(state.get("netbird_transport_degraded")) != degraded_active:
+                state["netbird_transport_degraded"] = degraded_active
+                write_json_file(STATE_PATH, state)
+                LOG.log(
+                    logging.WARNING if degraded_active else logging.INFO,
+                    "netbird transport degraded state changed active=%s consecutive_polls=%s peer_ip=%s",
+                    degraded_active,
+                    degraded_polls,
+                    status.get("peer_ip") or "<unknown>",
+                )
 
             if not has_netbird_credentials(state):
                 time.sleep(NETBIRD_RETRY_MIN_SECONDS)
@@ -5563,7 +5707,7 @@ document.addEventListener("DOMContentLoaded", () => {
   }
 
   function deriveViewState(state = {}) {
-    const transportReady = Boolean(state.transport_ready || (state.netbird?.connected && state.netbird?.peer_id));
+    const transportReady = Boolean(state.transport_ready || (state.netbird?.connected && (state.netbird?.peer_id || state.netbird?.peer_ip || state.netbird_peer_id)));
     const bindingReady = Boolean(
       state.binding_ready || (state.binding?.valid && state.device_id && state.home_id)
     );
@@ -5573,7 +5717,7 @@ document.addEventListener("DOMContentLoaded", () => {
   function pairingMessage(state = {}, view = {}, auth = {}) {
     const session = state.pairing_session || {};
     const localStatus = state.local_status || "";
-    if (["portal_trust_degraded", "binding_material_missing", "missing_binding_id", "stale_binding", "device_credential_revoked", "peer_id_missing", "peer_mismatch", "re_pair_required", "portal_persistence_failure"].includes(localStatus)) {
+    if (["portal_trust_degraded", "binding_material_missing", "missing_binding_id", "stale_binding", "device_credential_revoked", "peer_id_missing", "peer_mismatch", "re_pair_required", "portal_persistence_failure", "netbird_transport_degraded"].includes(localStatus)) {
       return state.local_status_detail || "A recovery step is required before this device can be trusted again.";
     }
     if (view.transportReady) {
@@ -5719,7 +5863,9 @@ document.addEventListener("DOMContentLoaded", () => {
       overlay_identity_basis: s.route?.overlay_identity_basis,
       effective_target_identity: s.route?.effective_target_identity,
       netbird_connected: s.netbird?.connected,
-      peer_id: s.netbird?.peer_id,
+      netbird_management_connected: s.netbird?.management_connected,
+      netbird_transport_degraded: s.netbird_transport_degraded,
+      peer_id: s.netbird?.peer_id || s.netbird_peer_id,
       peer_ip: s.netbird?.peer_ip,
       peer_name: s.netbird?.peer_name || s.peer_name,
       heartbeat_error: s.heartbeat_error,
@@ -5774,7 +5920,7 @@ document.addEventListener("DOMContentLoaded", () => {
     }
 
     const trustDegraded = s.local_status === "portal_trust_degraded";
-    const recoveryVisible = ["portal_trust_degraded", "binding_material_missing", "missing_binding_id", "stale_binding", "device_credential_revoked", "peer_id_missing", "peer_mismatch", "re_pair_required", "portal_persistence_failure"].includes(s.local_status || "");
+    const recoveryVisible = ["portal_trust_degraded", "binding_material_missing", "missing_binding_id", "stale_binding", "device_credential_revoked", "peer_id_missing", "peer_mismatch", "re_pair_required", "portal_persistence_failure", "netbird_transport_degraded"].includes(s.local_status || "");
     if (trustDegraded) {
       pairedArea.style.display = "block";
       pairedPill.textContent = "Portal trust degraded";
@@ -6016,7 +6162,7 @@ def api_binding_status() -> Dict[str, Any]:
         "binding": binding,
         "transport_ready": bool(state_copy.get("transport_ready")),
         "binding_ready": bool(state_copy.get("binding_ready")),
-        "peer_id": (state_copy.get("netbird") or {}).get("peer_id"),
+        "peer_id": display_peer_id_from_state(state_copy),
         "peer_ip": (state_copy.get("netbird") or {}).get("peer_ip"),
         "peer_name": (state_copy.get("netbird") or {}).get("peer_name") or state_copy.get("peer_name"),
         "device_id": state_copy.get("device_id"),
@@ -6045,7 +6191,7 @@ def api_route_status() -> Dict[str, Any]:
         "route_mode": route_state.get("route_mode"),
         "current_endpoint": route_state.get("current_endpoint"),
         "legacy_proxy_url": route_state.get("legacy_proxy_url"),
-        "peer_id": (state_copy.get("netbird") or {}).get("peer_id"),
+        "peer_id": display_peer_id_from_state(state_copy),
         "peer_ip": (state_copy.get("netbird") or {}).get("peer_ip"),
         "peer_name": (state_copy.get("netbird") or {}).get("peer_name") or state_copy.get("peer_name"),
         "target_host": route_state.get("target_host"),
