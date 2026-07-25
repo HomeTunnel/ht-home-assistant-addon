@@ -2367,7 +2367,21 @@ def supervisor_request_json(path: str) -> Dict[str, Any]:
     headers = supervisor_headers()
     if not headers:
         raise RuntimeError("SUPERVISOR_TOKEN missing")
-    return request_json("GET", f"{SUPERVISOR_URL}{path}", headers=headers, timeout_seconds=int(TARGET_DISCOVERY_TIMEOUT_SECONDS) + 1)
+    response = request_json(
+        "GET",
+        f"{SUPERVISOR_URL}{path}",
+        headers=headers,
+        timeout_seconds=int(TARGET_DISCOVERY_TIMEOUT_SECONDS) + 1,
+    )
+    # Native Supervisor endpoints use its API envelope:
+    # {"result": "ok", "data": {...}}. Core API proxy endpoints return the
+    # Core response directly, so preserve unwrapped responses for compatibility.
+    if response.get("result") == "ok" and isinstance(response.get("data"), dict):
+        return dict(response["data"])
+    if response.get("result") == "error":
+        message = str(response.get("message") or response.get("error") or "request failed")
+        raise RuntimeError(f"Supervisor API error: {message}")
+    return response
 
 
 def core_service_scheme() -> str:
