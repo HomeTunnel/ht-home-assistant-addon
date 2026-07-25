@@ -1,7 +1,7 @@
 name: HomeTunnel Client
 slug: hometunnel_client
 description: Secure remote access to Home Assistant through your HomeTunnel account — private encrypted tunnel, no port forwarding.
-version: "2.0.4"
+version: "2.0.5"
 url: https://github.com/HomeTunnel/ht-home-assistant-addon
 image: ghcr.io/hometunnel/{arch}-addon-hometunnel_client
 arch:
@@ -20,10 +20,6 @@ panel_icon: mdi:lan-connect
 panel_title: HomeTunnel
 homeassistant_api: true
 hassio_api: true
-# manager role is required for GET /network/info (Supervisor puts /network/.+
-# behind ROLE_MANAGER), which we use to discover the host's own LAN IP so the
-# route target can never mDNS-resolve to a DIFFERENT Home Assistant on the LAN.
-hassio_role: manager
 watchdog: http://[HOST]:[PORT:8099]/health
 options:
   log_level: info
