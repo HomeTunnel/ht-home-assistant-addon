@@ -18,6 +18,7 @@ import app  # type: ignore
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 CONFIG_PATH = ROOT / "config.yaml"
+START_SCRIPT_PATH = ROOT / "rootfs" / "start.sh"
 
 
 class DnsModeConfigTests(unittest.TestCase):
@@ -36,6 +37,10 @@ class DnsModeConfigTests(unittest.TestCase):
         self.assertIn("homeassistant_api: true", config)
         self.assertIn("hassio_api: true", config)
         self.assertNotIn("hassio_role:", config)
+
+    def test_start_script_imports_s6_container_environment(self) -> None:
+        first_line = START_SCRIPT_PATH.read_text(encoding="utf-8").splitlines()[0]
+        self.assertEqual(first_line, "#!/usr/bin/with-contenv sh")
 
     def test_missing_dns_mode_normalizes_to_off(self) -> None:
         self.assertEqual(app.normalize_dns_mode(None), "off")
