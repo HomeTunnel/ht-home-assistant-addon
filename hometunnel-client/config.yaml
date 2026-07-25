@@ -1,12 +1,19 @@
 name: HomeTunnel Client
 slug: hometunnel_client
 description: Secure remote access to Home Assistant through your HomeTunnel account — private encrypted tunnel, no port forwarding.
-version: "2.0.0"
+version: "2.0.1"
 url: https://github.com/HomeTunnel/ht-home-assistant-addon
 image: ghcr.io/hometunnel/{arch}-addon-hometunnel_client
 arch:
   - aarch64
   - amd64
+# Not supported on the Raspberry Pi 3 (1 GB RAM). HomeTunnel runs alongside Home
+# Assistant Core; on 1 GB hosts the combined memory use exhausts RAM and can
+# freeze the whole device. Excluding the board here stops Supervisor from
+# offering/installing the add-on on a Pi 3 (all other machines remain supported).
+machine:
+  - "!raspberrypi3"
+  - "!raspberrypi3-64"
 startup: application
 boot: auto
 init: false
