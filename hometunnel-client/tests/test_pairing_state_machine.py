@@ -125,6 +125,19 @@ class PairingUiStaticTests(unittest.TestCase):
         self.assertNotIn("normalizeVerificationUrl", js)
         self.assertNotIn("window.location.assign", js)
 
+    def test_active_status_refresh_does_not_restart_approval_poll_timer(self) -> None:
+        js = app.APP_JS
+        self.assertIn('let pollTimerKey = "";', js)
+        self.assertIn("const APPROVAL_POLL_INTERVAL_SECONDS = 5;", js)
+        self.assertIn("const pollMs = APPROVAL_POLL_INTERVAL_SECONDS * 1000;", js)
+        self.assertIn('const nextPollTimerKey = `${deviceCode || ""}:${pollMs}`;', js)
+        self.assertIn("if (pollTimer && pollTimerKey === nextPollTimerKey)", js)
+        self.assertIn("startPollTimer(auth.device_code);", js)
+        self.assertLess(
+            js.index("if (pollTimer && pollTimerKey === nextPollTimerKey)"),
+            js.index("stopPollTimer();", js.index("function startPollTimer")),
+        )
+
     def test_status_card_shows_only_important_statuses(self) -> None:
         html = app.index()
         js = app.APP_JS
@@ -277,6 +290,40 @@ class SupervisorHostTargetTests(unittest.TestCase):
             candidate, error = app.select_supervisor_host_target()
         self.assertIsNone(candidate)
         self.assertEqual(error, "no_primary_interface_ip")
+
+
+class NetbirdAgentStatePersistenceTests(unittest.TestCase):
+    def test_status_update_preserves_route_written_by_discovery(self) -> None:
+        latest_state = {
+            "agent_running": True,
+            "netbird": {"connected": True, "peer_ip": "100.87.103.25"},
+            "route": {
+                "target_ip": "192.168.68.159",
+                "resolved_target_ip": "192.168.68.159",
+                "effective_target_cidr": "192.168.68.159/32",
+                "target_source": "supervisor_network",
+                "needs_report": True,
+            },
+        }
+        live_status = {
+            "connected": True,
+            "peer_ip": "100.87.103.25",
+            "management_connected": True,
+        }
+        written: list[dict] = []
+
+        with (
+            patch.object(app, "default_state", return_value={}),
+            patch.object(app, "read_json_file", return_value=json.loads(json.dumps(latest_state))),
+            patch.object(app, "write_json_file", side_effect=lambda _path, value: written.append(json.loads(json.dumps(value)))),
+        ):
+            result = app.persist_netbird_agent_status(live_status)
+
+        self.assertEqual(result["route"]["target_ip"], "192.168.68.159")
+        self.assertEqual(result["route"]["effective_target_cidr"], "192.168.68.159/32")
+        self.assertTrue(result["route"]["needs_report"])
+        self.assertEqual(result["netbird"], live_status)
+        self.assertEqual(written, [result])
 
 
 class SupervisorCapabilityTests(unittest.TestCase):
