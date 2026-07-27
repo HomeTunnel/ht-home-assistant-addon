@@ -4992,6 +4992,23 @@ def send_heartbeat(status: Dict[str, Any], state: Dict[str, Any], options: Dict[
         return heartbeat_error
 
 
+def persist_netbird_agent_status(status: Dict[str, Any]) -> Dict[str, Any]:
+    """Persist a live NetBird observation without restoring stale route state.
+
+    Route discovery runs immediately before this update and may have written a
+    changed target to disk. Always merge into a fresh snapshot rather than the
+    caller's pre-discovery state.
+    """
+    latest_state = read_json_file(STATE_PATH, default_state())
+    if bool(latest_state.get("agent_running")) is True and dict(latest_state.get("netbird") or {}) == status:
+        LOG.debug("netbird agent state persistence skipped unchanged connected=%s", status.get("connected"))
+        return latest_state
+    latest_state["agent_running"] = True
+    latest_state["netbird"] = status
+    write_json_file(STATE_PATH, latest_state)
+    return latest_state
+
+
 def netbird_agent_loop() -> int:
     ensure_data_dir()
     write_agent_pid(os.getpid())
@@ -5021,12 +5038,7 @@ def netbird_agent_loop() -> int:
                 continue
 
             status["peer_name"] = str(status.get("peer_name") or state.get("peer_name") or "")
-            if bool(state.get("agent_running")) is True and dict(state.get("netbird") or {}) == status:
-                LOG.debug("netbird agent state persistence skipped unchanged connected=%s", status.get("connected"))
-            else:
-                state["agent_running"] = True
-                state["netbird"] = status
-                write_json_file(STATE_PATH, state)
+            state = persist_netbird_agent_status(status)
             route_state = refresh_route_runtime_state(options, status)
             state = read_json_file(STATE_PATH, default_state())
 
@@ -5754,9 +5766,11 @@ document.addEventListener("DOMContentLoaded", () => {
 
   let authError = null;
   let pollTimer = null;
+  let pollTimerKey = "";
   let refreshTimer = null;
   let currentDeviceCode = "";
   let startInFlight = false;
+  const APPROVAL_POLL_INTERVAL_SECONDS = 5;
   const IDLE_REFRESH_MS = 15000;
   const ACTIVE_REFRESH_MS = 3000;
 
@@ -5796,11 +5810,17 @@ document.addEventListener("DOMContentLoaded", () => {
   function stopPollTimer() {
     if (pollTimer) clearInterval(pollTimer);
     pollTimer = null;
+    pollTimerKey = "";
   }
 
-  function startPollTimer(intervalSeconds) {
-    const pollMs = Math.max(3, Number(intervalSeconds || 5)) * 1000;
+  function startPollTimer(deviceCode) {
+    const pollMs = APPROVAL_POLL_INTERVAL_SECONDS * 1000;
+    const nextPollTimerKey = `${deviceCode || ""}:${pollMs}`;
+    if (pollTimer && pollTimerKey === nextPollTimerKey) {
+      return;
+    }
     stopPollTimer();
+    pollTimerKey = nextPollTimerKey;
     pollTimer = window.setInterval(() => {
       void pollAuth();
     }, pollMs);
@@ -5873,7 +5893,7 @@ document.addEventListener("DOMContentLoaded", () => {
       authArea.style.display = "block";
       setUserCode(auth.user_code);
       authExp.textContent = formatExpiry(auth.expires_at);
-      pollIntervalEl.textContent = auth.poll_interval || 5;
+      pollIntervalEl.textContent = APPROVAL_POLL_INTERVAL_SECONDS;
     } else {
       authArea.style.display = "none";
       setUserCode("");
@@ -5891,7 +5911,7 @@ document.addEventListener("DOMContentLoaded", () => {
       stopPollTimer();
       return;
     }
-    startPollTimer(auth.poll_interval || 5);
+    startPollTimer(auth.device_code);
   }
 
   function deriveViewState(state = {}) {
