@@ -8,6 +8,42 @@ from network_context import (
 )
 
 
+# Bounded so a large home cannot push the payload past the portal's 16KB cap.
+MAX_REMOTE_PEER_REPORTS = 50
+
+
+def build_remote_peer_reports(status: Dict[str, Any]) -> list[Dict[str, Any]]:
+    """How each connected remote peer reaches this routing peer.
+
+    Relayed-vs-P2P is a property of a peer *pair*, so it exists only on the two
+    clients involved — never on the management API. This device's view is the
+    only place the portal can learn how its clients are connected.
+
+    Sorted by peer IP and capped: the agent skips heartbeats whose payload
+    fingerprint is unchanged, so an unordered or unbounded list would churn that
+    fingerprint on every peer reshuffle and defeat the dedupe.
+    """
+    reports: list[Dict[str, Any]] = []
+    for entry in status.get("remote_peers") or []:
+        if not isinstance(entry, dict):
+            continue
+        connection_type = entry.get("connection_type")
+        peer_ip = entry.get("peer_ip")
+        # Without a transport there is nothing to report, and without an IP the
+        # portal cannot match the entry to a peer row.
+        if connection_type not in ("p2p", "relayed") or not peer_ip:
+            continue
+        reports.append(
+            {
+                "peerIp": peer_ip,
+                "peerName": entry.get("peer_name"),
+                "connectionType": connection_type,
+            }
+        )
+    reports.sort(key=lambda item: item["peerIp"])
+    return reports[:MAX_REMOTE_PEER_REPORTS]
+
+
 def build_heartbeat_payload(status: Dict[str, Any], state: Dict[str, Any]) -> Dict[str, Any]:
     route_state = dict(state.get("route") or {})
     device_id = state.get("device_id")
@@ -48,6 +84,7 @@ def build_heartbeat_payload(status: Dict[str, Any], state: Dict[str, Any]) -> Di
     local_ipv4_addresses = route_state.get("local_ipv4_addresses") or []
     local_ipv4_subnets = route_state.get("local_ipv4_subnets") or []
     local_ipv4_interfaces = route_state.get("local_ipv4_interfaces") or []
+    remote_peer_reports = build_remote_peer_reports(status)
 
     return {
         "deviceId": device_id,
@@ -69,6 +106,7 @@ def build_heartbeat_payload(status: Dict[str, Any], state: Dict[str, Any]) -> Di
             if peer_id
             else {}
         ),
+        **({"remotePeers": remote_peer_reports} if remote_peer_reports else {}),
         "health": {
             "status": route_state.get("health_status") or "unknown",
             "routeHealthy": bool(route_state.get("healthy")),

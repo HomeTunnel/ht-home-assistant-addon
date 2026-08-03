@@ -1518,5 +1518,70 @@ class PairingStateMachineTests(unittest.TestCase):
         self.assertIsNone(__import__("re").search(r"netbird\.io|/api/setup-keys|/api/peers/|/api/groups/|/api/policies/", source))
 
 
+class RemotePeerConnectionTypeTests(unittest.TestCase):
+    """Transport extraction from the real `netbird status --json` shape."""
+
+    def test_connection_type_is_read_from_status_json(self) -> None:
+        parsed = {
+            "peers": {
+                "total": 2,
+                "connected": 2,
+                "details": [
+                    {
+                        "fqdn": "phone.netbird.cloud",
+                        "netbirdIp": "100.64.0.20",
+                        "publicKey": "p" * 44,
+                        "status": "Connected",
+                        "connectionType": "P2P",
+                        "relayAddress": "",
+                    },
+                    {
+                        "fqdn": "laptop.netbird.cloud",
+                        "netbirdIp": "100.64.0.30",
+                        "publicKey": "l" * 44,
+                        "status": "Connected",
+                        "connectionType": "Relayed",
+                        "relayAddress": "rels://relay.example:443",
+                    },
+                ],
+            }
+        }
+        self_peer = {"peer_id": None, "peer_ip": "100.64.0.10", "peer_name": "haos"}
+
+        peers = app.extract_connected_remote_peers(parsed, self_peer)
+
+        by_ip = {peer["peer_ip"]: peer for peer in peers}
+        self.assertEqual(by_ip["100.64.0.20"]["connection_type"], "p2p")
+        self.assertEqual(by_ip["100.64.0.30"]["connection_type"], "relayed")
+
+    def test_disconnected_peers_are_excluded(self) -> None:
+        parsed = {
+            "peers": {
+                "details": [
+                    {"netbirdIp": "100.64.0.20", "status": "Disconnected", "connectionType": "Relayed"},
+                ]
+            }
+        }
+
+        peers = app.extract_connected_remote_peers(parsed, {"peer_id": None, "peer_ip": None, "peer_name": None})
+
+        self.assertEqual(peers, [])
+
+    def test_unknown_transport_reports_nothing(self) -> None:
+        for value in ("", "  ", "wireguard", "unknown", None):
+            with self.subTest(value=value):
+                self.assertIsNone(app.normalize_peer_connection_type({"connectionType": value}))
+
+    def test_transport_matching_is_case_insensitive(self) -> None:
+        self.assertEqual(app.normalize_peer_connection_type({"connectionType": "p2p"}), "p2p")
+        self.assertEqual(app.normalize_peer_connection_type({"connectionType": "RELAYED"}), "relayed")
+
+    def test_self_peer_shape_is_unchanged(self) -> None:
+        """normalize_netbird_peer is shared with the self peer, which has no transport."""
+        normalized = app.normalize_netbird_peer({"netbirdIp": "100.64.0.10", "fqdn": "haos"})
+
+        self.assertNotIn("connection_type", normalized)
+
+
 if __name__ == "__main__":
     unittest.main()

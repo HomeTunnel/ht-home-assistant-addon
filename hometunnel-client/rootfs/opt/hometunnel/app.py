@@ -1613,6 +1613,21 @@ def peer_connected_value(entry: Dict[str, Any]) -> bool:
     return state in {"connected", "online", "active"}
 
 
+def normalize_peer_connection_type(entry: Dict[str, Any]) -> Optional[str]:
+    """Map a remote peer's transport to the portal's vocabulary.
+
+    `netbird status --json` renders PeerState.relayed as connectionType "P2P" or
+    "Relayed". Anything else — an older client, a value we do not recognise —
+    reports nothing rather than guessing, because a wrong transport claim is
+    worse than an absent one.
+    """
+    value = first_present_string(entry, "connection_type", "connectionType", "connType")
+    if value is None:
+        return None
+    normalized = value.strip().lower()
+    return normalized if normalized in ("p2p", "relayed") else None
+
+
 def extract_connected_remote_peers(parsed: Dict[str, Any], self_peer: Dict[str, Optional[str]]) -> list[Dict[str, Optional[str]]]:
     remote_sections = []
     for key in ("peers", "remotePeers", "remote_peers"):
@@ -1641,6 +1656,10 @@ def extract_connected_remote_peers(parsed: Dict[str, Any], self_peer: Dict[str, 
             if identity in seen:
                 continue
             seen.add(identity)
+            # Read transport off the raw entry rather than from
+            # normalize_netbird_peer: that shape is shared with the self peer,
+            # which has no connection type of its own.
+            normalized["connection_type"] = normalize_peer_connection_type(candidate)
             connected_peers.append(normalized)
     return connected_peers
 

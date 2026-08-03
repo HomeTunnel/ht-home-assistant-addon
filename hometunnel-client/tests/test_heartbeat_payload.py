@@ -8,7 +8,7 @@ ROOT = pathlib.Path(__file__).resolve().parents[1] / "rootfs" / "opt" / "hometun
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from heartbeat_payload import build_heartbeat_payload
+from heartbeat_payload import MAX_REMOTE_PEER_REPORTS, build_heartbeat_payload
 from network_context import build_hometunnel_dns_hostname
 
 
@@ -231,6 +231,76 @@ class HeartbeatPayloadTests(unittest.TestCase):
         payload = build_heartbeat_payload(status, state)
 
         self.assertNotIn("peer", payload)
+
+    def test_remote_peers_report_transport_sorted_and_filtered(self) -> None:
+        status = {
+            "connected": True,
+            "peer_id": "peer-123",
+            "peer_ip": "100.64.0.10",
+            "peer_name": "haos-peer",
+            "remote_peers": [
+                {"peer_ip": "100.64.0.30", "peer_name": "laptop", "connection_type": "relayed"},
+                {"peer_ip": "100.64.0.20", "peer_name": "phone", "connection_type": "p2p"},
+                # No transport: nothing to report, so it is left out entirely.
+                {"peer_ip": "100.64.0.40", "peer_name": "tablet", "connection_type": None},
+                # No IP: the portal would have nothing to match the entry against.
+                {"peer_ip": None, "peer_name": "ghost", "connection_type": "p2p"},
+            ],
+        }
+        state = {
+            "device_id": "device-123",
+            "home_id": "home-456",
+            "netbird_peer_id": "nb-management-peer-123",
+            "route": {"ha_access_mode": "direct_ip", "target_ip": "192.168.68.141"},
+        }
+
+        payload = build_heartbeat_payload(status, state)
+
+        self.assertEqual(
+            payload["remotePeers"],
+            [
+                {"peerIp": "100.64.0.20", "peerName": "phone", "connectionType": "p2p"},
+                {"peerIp": "100.64.0.30", "peerName": "laptop", "connectionType": "relayed"},
+            ],
+        )
+
+    def test_remote_peers_omitted_when_no_transport_is_known(self) -> None:
+        status = {
+            "connected": True,
+            "peer_id": "peer-123",
+            "peer_ip": "100.64.0.10",
+            "remote_peers": [{"peer_ip": "100.64.0.20", "connection_type": None}],
+        }
+        state = {
+            "device_id": "device-123",
+            "home_id": "home-456",
+            "netbird_peer_id": "nb-management-peer-123",
+            "route": {"ha_access_mode": "direct_ip", "target_ip": "192.168.68.141"},
+        }
+
+        payload = build_heartbeat_payload(status, state)
+
+        self.assertNotIn("remotePeers", payload)
+
+    def test_remote_peers_are_capped(self) -> None:
+        status = {
+            "connected": True,
+            "peer_id": "peer-123",
+            "peer_ip": "100.64.0.1",
+            "remote_peers": [
+                {"peer_ip": f"100.64.1.{index}", "connection_type": "p2p"} for index in range(1, 120)
+            ],
+        }
+        state = {
+            "device_id": "device-123",
+            "home_id": "home-456",
+            "netbird_peer_id": "nb-management-peer-123",
+            "route": {"ha_access_mode": "direct_ip", "target_ip": "192.168.68.141"},
+        }
+
+        payload = build_heartbeat_payload(status, state)
+
+        self.assertEqual(len(payload["remotePeers"]), MAX_REMOTE_PEER_REPORTS)
 
     def test_wireguard_public_key_is_diagnostic_only(self) -> None:
         wireguard_public_key = "u" * 44
