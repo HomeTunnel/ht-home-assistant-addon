@@ -1,0 +1,9 @@
+**
+!Dockerfile
+!LICENSE
+!LICENSES/
+!LICENSES/**
+!rootfs/
+!rootfs/**
+rootfs/**/__pycache__/
+rootfs/**/*.pyc
