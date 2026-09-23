@@ -2,7 +2,7 @@ ARG BUILD_FROM=ghcr.io/hassio-addons/base:21.0.5
 
 # Rebuild the pinned client with the reviewed dependency lock: upstream 0.78.2
 # binaries still contain gRPC 1.80.0, which has fixed high-severity advisories.
-FROM golang:1.26.8-alpine3.24 AS netbird-build
+FROM golang:1.27.0-alpine3.24 AS netbird-build
 ARG NETBIRD_VERSION=0.78.2
 ARG NETBIRD_SOURCE_SHA256=e54b73c09653a533b719ec7e275d9af05f0ffaae548d697570bf6b5d71b13fc8
 ENV GOTOOLCHAIN=local
