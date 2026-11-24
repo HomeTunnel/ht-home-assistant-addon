@@ -21,7 +21,8 @@ observation data sent to the portal. No history backlog is sent. Stopping
 sharing stops local checks immediately. The add-on sends a disabled
 manifest when it can reach the portal. Selecting a different entity or
 endpoint creates a new opaque ID. After a pairing reset or a device, home,
-binding, or paired-origin change, configure local selections again.
+binding, or paired-origin change, configure local selections again. A sharing
+preview opened before the change must be reviewed again for the current pairing.
 
 ## Compatibility
 
@@ -41,8 +42,9 @@ installation has no Supervisor proxy. TCP checks require the standard
 HAOS add-on bridge and an unambiguous primary RFC1918 IPv4 LAN.
 Targets must be inside that LAN and its /24 cap, excluding network and
 broadcast addresses, host addresses, nameservers, gateways, and the
-Supervisor network. A missing LAN boundary or non-bridge route yields
-a configuration status. TCP checks do not establish an overlay route.
+Supervisor network. If the add-on cannot determine the LAN or read the route,
+it skips the connection and reports an unknown result. A confirmed excluded
+address or non-bridge route yields a configuration error.
 
 - [Supervisor communication](https://contributors.home-assistant.io/apps/guides/communication/)
 - [Supervisor network info](https://contributors.home-assistant.io/apps/supervisor-api/host/#get-networkinfo)
@@ -87,6 +89,8 @@ isolation, and refusal to forward redirect credentials.
 | Missing or renamed entity | Configuration needs attention, with no inferred recovery |
 | Local service on the primary wired or Wi-Fi LAN | IPv4 socket is bound to the standard add-on bridge, accepts only the configured host and port, and sends no payload |
 | Outside-LAN, gateway, DNS, Supervisor, or overlay destination | Configuration status and no TCP connection |
+| Supervisor network information unavailable | TCP status is unknown and the add-on skips the connection |
+| First sharing preview open during re-pairing to another home | Saving the old preview is rejected and the new home requires a fresh review |
 | Portal outage and prolonged lease lapse | Sampling stops by lease expiry, then resumes after fresh portal consent without a backlog |
 | Local disable during a slow probe, followed by re-pairing | In-flight work stops, a disabled manifest is sent if possible, and selections are cleared on new pairing |
 | Old portal or old add-on | Normal pairing and tunnel operation continue, with Homeview unavailable until both sides support it |

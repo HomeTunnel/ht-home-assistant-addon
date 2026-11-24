@@ -195,9 +195,15 @@ class Settings:
         self.path.unlink(missing_ok=True)
         return None
 
-    def get(self, identity):
+    def get(self, identity, *, for_preview=False):
         with self.lock:
-            return self._read(identity)
+            current = self._read(identity)
+            if for_preview and identity is not None and current is None:
+                # Even the first, still-disabled form belongs to a specific pairing.
+                monitors = (Monitor(new_id(), "ha_api", "Home Assistant"),)
+                current = Selection(identity.scope, new_id(), False, False, monitors)
+                self._write(current)
+            return current
 
     def _write(self, selection):
         self.path.parent.mkdir(parents=True, exist_ok=True)
@@ -226,11 +232,11 @@ class Settings:
                     current = Selection(current.scope, new_id(), False, True, current.monitors)
                     self._write(current)
                 return current
-            if identity is None or enabled is not True or set(body) != {"enabled", "monitors", "revision"}:
+            if enabled is not True or set(body) != {"enabled", "monitors", "revision"}:
                 raise ValueError("invalid_settings")
-            if body["revision"] != (current.revision if current else None):
+            if current is None or body["revision"] != current.revision:
                 raise ValueError("selection_changed")
-            monitors = parse_monitors(body["monitors"], current.monitors if current else ())
+            monitors = parse_monitors(body["monitors"], current.monitors)
             # A label should never copy a local target or the device credential.
             private = {identity.token, *(m.entity for m in monitors if m.entity), *(m.ip for m in monitors if m.ip)}
             supervisor_token = os.environ.get("SUPERVISOR_TOKEN")
@@ -238,7 +244,7 @@ class Settings:
                 private.add(supervisor_token)
             if any(secret in m.label for secret in private for m in monitors):
                 raise ValueError("invalid_label")
-            if current and current.enabled and current.monitors == monitors:
+            if current.enabled and current.monitors == monitors:
                 return current
             selected = Selection(identity.scope, new_id(), True, False, monitors)
             self._write(selected)

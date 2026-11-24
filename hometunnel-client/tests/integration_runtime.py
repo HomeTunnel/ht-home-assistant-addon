@@ -87,7 +87,7 @@ class RuntimeSecurityTests(unittest.IsolatedAsyncioTestCase):
                     self.assertEqual(response.headers["cache-control"], "private, no-store")
                     self.assertFalse(response.json()["enabled"])
                     enabled = {
-                        "enabled": True, "revision": None,
+                        "enabled": True, "revision": response.json()["revision"],
                         "monitors": [{"kind": "ha_api", "label": "Home Assistant"},
                                      {"kind": "battery_binary", "label": "Sensor battery", "entity": "binary_sensor.test_battery"}],
                     }
@@ -98,6 +98,38 @@ class RuntimeSecurityTests(unittest.IsolatedAsyncioTestCase):
                     self.assertEqual((await client.post(path, json=enabled, headers=headers)).status_code, 409)
                     off = await client.post(path, json={"enabled": False}, headers=headers)
                     self.assertFalse(off.json()["enabled"])
+
+    async def test_first_sharing_preview_expires_after_repair(self):
+        with tempfile.TemporaryDirectory() as directory:
+            state = {
+                "portal_base_url": "https://portal.example", "home_id": "home-a",
+                "device_id": "device", "device_token": "device-secret", "binding": {"binding_id": "binding-a"},
+            }
+            path = "/api/homeview/local"
+            headers = {"X-Homeview-UI": "1"}
+            runtime = HomeviewRuntime(pathlib.Path(directory) / "homeview.json", lambda: state)
+            ingress = httpx.ASGITransport(app=app.app, client=("172.30.32.2", 4567))
+            with patch.object(app, "homeview", runtime):
+                async with httpx.AsyncClient(transport=ingress, base_url="http://addon", headers=headers) as client:
+                    home_a = (await client.get(path)).json()
+                    preview = {"enabled": True, "revision": home_a["revision"],
+                               "monitors": [{"kind": "ha_api", "label": "Home A only"}]}
+                    self.assertFalse(home_a["enabled"])
+                    self.assertTrue(preview["revision"])
+                    state.update(home_id="home-b", binding={"binding_id": "binding-b"})
+                    stale = await client.post(path, json=preview)
+                    self.assertEqual(stale.status_code, 409)
+                    home_b = (await client.get(path)).json()
+                    self.assertNotEqual(home_a["revision"], home_b["revision"])
+                    self.assertFalse(home_b["enabled"])
+                    self.assertNotIn("Home A only", str(home_b))
+                    for revision in (None, preview["revision"]):
+                        self.assertEqual((await client.post(path, json={**preview, "revision": revision})).status_code, 409)
+                    self.assertFalse((await client.get(path)).json()["enabled"])
+                    fresh = await client.post(path, json={"enabled": True, "revision": home_b["revision"],
+                                                         "monitors": [{"kind": "ha_api", "label": "Home B"}]})
+                    self.assertEqual(fresh.status_code, 200)
+                    self.assertTrue(fresh.json()["enabled"])
 
     async def test_homeview_worker_reports_while_netbird_is_down(self):
         fixture_dir = pathlib.Path(__file__).with_name("fixtures") / "homeview_v1"
@@ -132,7 +164,7 @@ class RuntimeSecurityTests(unittest.IsolatedAsyncioTestCase):
                 "binding": {"binding_id": "a-binding"}, "netbird": {"connected": False},
             }
             runtime = HomeviewRuntime(pathlib.Path(directory) / "homeview.json", lambda: state)
-            runtime.apply({"enabled": True, "revision": None, "monitors": [{"kind": "ha_api", "label": "Home Assistant"}]})
+            runtime.apply({"enabled": True, "revision": runtime.view()["revision"], "monitors": [{"kind": "ha_api", "label": "Home Assistant"}]})
             transport = httpx.MockTransport(homeview_transport)
             create = httpx.AsyncClient
             with patch("homeview.httpx.AsyncClient", side_effect=lambda **kw: create(transport=transport, **kw)):

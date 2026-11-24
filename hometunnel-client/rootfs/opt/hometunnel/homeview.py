@@ -244,17 +244,17 @@ class HomeviewRuntime:
     def identity(self):
         return Identity.read(self.read_state())
 
-    def _selection(self):
+    def _selection(self, *, for_preview=False):
         with self.lock:
             identity = self.identity()
             if self.blocked_scope and (not identity or identity.scope != self.blocked_scope):
                 self.blocked_scope = None
             if identity and identity.scope == self.blocked_scope:
                 identity = None
-            return identity, self.settings.get(identity), self.epoch
+            return identity, self.settings.get(identity, for_preview=for_preview), self.epoch
 
     def view(self):
-        identity, selection, _ = self._selection()
+        identity, selection, _ = self._selection(for_preview=True)
         status = "off"
         if selection and selection.enabled:
             status = self.reporter.status

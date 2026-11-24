@@ -7,7 +7,7 @@ from pathlib import Path
 import sys
 import tempfile
 import unittest
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, Mock, patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "rootfs/opt/hometunnel"))
 # Production httpx is only needed by the transport. The unit suite uses the
@@ -15,7 +15,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "rootfs/opt/hometun
 import test_client_recovery_state  # noqa: F401
 
 from homeview import HomeviewRuntime, Portal, Reporter, parse_config
-from homeview_checks import Collector, RequestFailure, entity_observation, lan_boundary, observation, safe_route, safe_target, stamp
+from homeview_checks import Collector, RequestFailure, entity_observation, lan_boundary, observation, safe_route, safe_target, stamp, tcp_probe
 from homeview_config import Identity, Settings, parse_monitors, portal_origin
 
 FIXTURES = Path(__file__).with_name("fixtures") / "homeview_v1"
@@ -59,7 +59,9 @@ class ConfigurationTests(unittest.TestCase):
             settings = Settings(p)
             rows = [{k: v for k, v in m.local().items() if k != "id"} for m in MONITORS]
             self.assertIsNone(settings.get(IDENTITY))
-            saved = settings.apply(IDENTITY, {"enabled": True, "revision": None, "monitors": rows})
+            preview = settings.get(IDENTITY, for_preview=True)
+            self.assertFalse(preview.enabled)
+            saved = settings.apply(IDENTITY, {"enabled": True, "revision": preview.revision, "monitors": rows})
             self.assertEqual(p.stat().st_mode & 0o777, 0o600)
             self.assertNotIn(IDENTITY.token, p.read_text())
             self.assertEqual(Settings(p).get(IDENTITY), saved)
@@ -76,7 +78,7 @@ class ConfigurationTests(unittest.TestCase):
             p = Path(root) / "settings.json"
             current = pairing()
             runtime = HomeviewRuntime(p, lambda: current)
-            runtime.apply({"enabled": True, "revision": None, "monitors": [{"kind": "ha_api", "label": "Home Assistant"}]})
+            runtime.apply({"enabled": True, "revision": runtime.view()["revision"], "monitors": [{"kind": "ha_api", "label": "Home Assistant"}]})
             runtime.apply({"enabled": False})
             self.assertEqual(runtime.view()["status"], "stopping")
             stored = Settings(p).get(IDENTITY)
@@ -95,7 +97,8 @@ class ConfigurationTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as root:
             p = Path(root) / "settings.json"
             settings = Settings(p)
-            settings.apply(IDENTITY, {"enabled": True, "revision": None, "monitors": [{"kind": "ha_api", "label": "HA"}]})
+            preview = settings.get(IDENTITY, for_preview=True)
+            settings.apply(IDENTITY, {"enabled": True, "revision": preview.revision, "monitors": [{"kind": "ha_api", "label": "HA"}]})
             self.assertIsNone(settings.get(Identity(IDENTITY.origin, "different-home", IDENTITY.device, IDENTITY.binding, IDENTITY.token)))
             self.assertFalse(p.exists())
 
@@ -169,9 +172,33 @@ class MeasurementTests(unittest.IsolatedAsyncioTestCase):
             {"message": "API running."}, RequestFailure(), state(MONITORS[2].entity, "25"),
         ])):
             observations = await collector.collect(MONITORS, lambda: True)
-            self.assertEqual(observations[1]["reason"], "unsafe_target")
+            self.assertEqual((observations[1]["result"], observations[1]["reason"]), ("unknown", "check_failed"))
             self.assertEqual(observations[2]["batteryPercent"], 25)
             probe.assert_not_awaited()
+
+    async def test_known_excluded_address_is_rejected_without_probing(self):
+        probe = AsyncMock()
+        collector = Collector(object(), lambda: "local-token", probe)
+        monitors = parse_monitors([MONITORS[0].local(), {**MONITORS[1].local(), "ip": "192.168.5.1"}], stored=True)
+        with patch("homeview_checks.request_json", new=AsyncMock(side_effect=[
+            {"message": "API running."}, {"result": "ok", "data": LAN},
+        ])):
+            _, tcp = await collector.collect(monitors, lambda: True)
+        self.assertEqual((tcp["result"], tcp["reason"]), ("configuration_error", "unsafe_target"))
+        probe.assert_not_awaited()
+
+    async def test_route_lookup_failure_and_rejected_route_do_not_connect(self):
+        for status, output, expected in (
+            (1, b"", ("unknown", "check_failed")),
+            (0, b"invalid", ("unknown", "check_failed")),
+            (0, b"[]", ("unknown", "check_failed")),
+            (0, b'[{"dev":"wt0"}]', ("configuration_error", "unsafe_target")),
+        ):
+            with self.subTest(status=status, output=output):
+                process = Mock(returncode=status, communicate=AsyncMock(return_value=(output, b"")))
+                with patch("asyncio.create_subprocess_exec", new=AsyncMock(return_value=process)), patch("socket.socket") as connect:
+                    self.assertEqual(await tcp_probe("192.168.5.20", 443, "172.30.32.1"), expected)
+                    connect.assert_not_called()
 
 
 class FakePortal:

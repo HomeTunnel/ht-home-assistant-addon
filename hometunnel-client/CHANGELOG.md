@@ -1,5 +1,11 @@
 # Changelog
 
+## 2.1.0 — Homeview
+
+- Opt in from the add-on to share selected Home Assistant, entity, battery and LAN TCP checks with your home's Homeview in the portal. Reporting works while NetBird is disconnected.
+- Review the labels and checks before sharing. Changing the pairing invalidates an open sharing preview.
+- LAN checks skip the connection when the permitted network or route cannot be determined and show an unknown result.
+
 ## 2.0.13 — Initial public release
 
 - Discover Core upstream IP, port and TLS from authenticated Supervisor information, preserving legacy port 8123 support.

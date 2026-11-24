@@ -193,7 +193,12 @@ async def tcp_probe(ip, port, bridge_gateway):
                 except ProcessLookupError:
                     pass
                 await process.wait()
-        if process.returncode or not safe_route(json.loads(output), bridge_gateway):
+        if process.returncode:
+            return "unknown", "check_failed"
+        routes = json.loads(output)
+        if not isinstance(routes, list) or not routes or not all(isinstance(route, dict) and route for route in routes):
+            return "unknown", "check_failed"
+        if not safe_route(routes, bridge_gateway):
             return "configuration_error", "unsafe_target"
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
             # Linux constant, even on Python builds that do not export the name.
@@ -203,17 +208,17 @@ async def tcp_probe(ip, port, bridge_gateway):
                 loop = asyncio.get_running_loop()
                 await asyncio.wait_for(loop.sock_connect(sock, (ip, port)), max(0, CHECK_TIMEOUT - (loop.time() - start)))
             except PermissionError:
-                return "configuration_error", "unsafe_target"
+                return "configuration_error", "permission_denied"
             except (OSError, asyncio.TimeoutError):
                 return "not_responding", None
         return "responding", None
 
     try:
         return await connect()
-    except asyncio.TimeoutError:
+    except PermissionError:
+        return "configuration_error", "permission_denied"
+    except (OSError, ValueError, asyncio.TimeoutError):
         return "unknown", "check_failed"
-    except (OSError, ValueError):
-        return "configuration_error", "unsafe_target"
 
 
 class Collector:
@@ -261,6 +266,8 @@ class Collector:
                 if not allowed():
                     return observation(monitor, "unknown", "check_failed")
                 if monitor.kind == "tcp_service":
+                    if boundary is None:
+                        return observation(monitor, "unknown", "check_failed")
                     if not safe_target(monitor.ip, boundary):
                         return observation(monitor, "configuration_error", "unsafe_target")
                     result, reason = await self.probe(monitor.ip, monitor.port, boundary[-1])

@@ -43,6 +43,7 @@ document.addEventListener("DOMContentLoaded", () => {
   function discardPreview() {
     preview = null;
     $("preview").hidden = true;
+    $("shared").replaceChildren();
   }
 
   function field(row, title, input) {
@@ -142,7 +143,7 @@ document.addEventListener("DOMContentLoaded", () => {
       if (!res.ok) throw Error();
       const state = await res.json();
       if (busy) return;
-      if (!selected || reset) render(state);
+      if (!selected || reset || state.revision !== selected.revision) render(state);
       else notice(state);
     } catch {
       $("status").textContent = "Monitoring settings are unavailable.";
@@ -157,7 +158,13 @@ document.addEventListener("DOMContentLoaded", () => {
     try {
       const result = await call("POST", body);
       if (result.status === 409) {
-        $("error").textContent = "Settings changed in another tab. Reopen this panel to reload them.";
+        discardPreview();
+        selected = null;
+        rows.replaceChildren();
+        $("add").disabled = $("review").disabled = true;
+        $("error").textContent = "Pairing or settings changed. Review the current checks before sharing.";
+        const refreshed = await call("GET");
+        if (refreshed.ok) render(await refreshed.json());
         return;
       }
       if (!result.ok) {
