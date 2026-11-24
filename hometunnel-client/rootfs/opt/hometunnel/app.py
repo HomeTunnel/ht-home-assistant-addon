@@ -40,6 +40,7 @@ from network_context import (
     normalize_home_assistant_access_mode as normalize_ha_access_mode,
 )
 from heartbeat_payload import build_heartbeat_payload
+from homeview import HomeviewRuntime
 
 DATA_DIR = Path("/data")
 STATE_PATH = DATA_DIR / "state.json"
@@ -1349,6 +1350,9 @@ def read_state_snapshot() -> Dict[str, Any]:
     if not isinstance(state, dict):
         state = default_state()
     return state
+
+
+homeview = HomeviewRuntime(DATA_DIR / "homeview.json", lambda: read_state_snapshot())
 
 
 def update_proxy_runtime_state(
@@ -5992,6 +5996,7 @@ def startup_event() -> None:
     log_method = LOG.info if capability["received"] else LOG.error
     log_method('supervisor_api_capability', {'received': capability['received']})
     load_state()
+    homeview.start()
     persist_runtime_observations(load_options())
     start_netbird_agent_if_needed()
     thread = threading.Thread(target=ui_refresh_loop, daemon=True)
@@ -6001,6 +6006,7 @@ def startup_event() -> None:
 
 @app.on_event("shutdown")
 def shutdown_event() -> None:
+    homeview.stop()
     _stop_event.set()
 
 
@@ -6586,6 +6592,10 @@ async def api_auth_poll(request: Request) -> JSONResponse:
 @app.post("/api/pairing/reset")
 def api_pairing_reset() -> JSONResponse:
     LOG.info('post_api_pairing_reset')
+    try:
+        homeview.clear()
+    except OSError:
+        LOG.warning("homeview_settings_cleanup_failed")
     invalidate_runtime_caches("pairing_reset")
     state_snapshot = read_state_snapshot()
     LOG.info('pairing_reset_started')
@@ -6671,6 +6681,64 @@ def api_agent_restart() -> JSONResponse:
             status_code=500,
         )
     return JSONResponse({"ok": True, "started": True})
+
+
+def homeview_ui_request(request: Request) -> bool:
+    # Supervisor ingress protects the route; a custom header also prevents a
+    # cross-origin browser form from changing monitoring consent.
+    return (request.headers.get("x-homeview-ui") == "1"
+            and request.headers.get("sec-fetch-site") in (None, "same-origin"))
+
+
+def homeview_response(body: dict, status_code: int = 200) -> JSONResponse:
+    return JSONResponse(body, status_code=status_code, headers={"Cache-Control": "private, no-store"})
+
+
+@app.get("/api/homeview/local")
+def api_homeview_get(request: Request) -> JSONResponse:
+    if not homeview_ui_request(request):
+        return homeview_response({"error": "forbidden"}, 403)
+    try:
+        return homeview_response(homeview.view())
+    except OSError:
+        return homeview_response({"error": "settings_unavailable"}, 503)
+
+
+@app.post("/api/homeview/local")
+async def api_homeview_apply(request: Request) -> JSONResponse:
+    if not homeview_ui_request(request):
+        return homeview_response({"error": "forbidden"}, 403)
+    if request.headers.get("content-type", "").split(";", 1)[0].strip().lower() != "application/json":
+        return homeview_response({"error": "invalid_settings"}, 415)
+
+    async def read_settings():
+        data = bytearray()
+        async for chunk in request.stream():
+            if len(data) + len(chunk) > 32768:
+                raise ValueError("settings_too_large")
+            data.extend(chunk)
+        return json.loads(data)
+
+    try:
+        body = await asyncio.wait_for(read_settings(), 3)
+    except (ValueError, RecursionError, asyncio.TimeoutError):
+        return homeview_response({"error": "invalid_settings"}, 400)
+    try:
+        await asyncio.to_thread(homeview.apply, body)
+        return homeview_response(await asyncio.to_thread(homeview.view))
+    except ValueError as exc:
+        code = str(exc)
+        if code == "selection_changed":
+            return homeview_response({"error": code}, 409)
+        return homeview_response({"error": "invalid_settings"}, 400)
+    except OSError:
+        return homeview_response({"error": "settings_unavailable"}, 503)
+
+
+@app.get("/homeview.js")
+def homeview_js() -> Response:
+    script = Path(__file__).with_name("homeview.js").read_text(encoding="utf-8")
+    return Response(content=script, media_type="application/javascript")
 
 
 @app.get("/", response_class=HTMLResponse)
@@ -6777,6 +6845,11 @@ def index() -> str:
         0%, 100% { opacity: 0.35; }
         50% { opacity: 1; }
       }
+      #homeview fieldset { border: 1px solid var(--line); border-radius: 10px; margin: 0 0 12px; min-width: 0; }
+      #homeview label { display: inline-flex; flex-direction: column; gap: 4px; margin: 4px 8px 8px 0; max-width: 100%; }
+      #homeview [hidden] { display: none; }
+      #homeview input, #homeview select { font: inherit; max-width: 100%; }
+      #homeview-preview { margin-top: 12px; }
       @media (max-width: 700px) {
         dl { grid-template-columns: 1fr; }
         .code { font-size: 26px; }
@@ -6833,6 +6906,33 @@ def index() -> str:
           <div id="pairedText" class="muted" style="margin-top:10px">This add-on is enrolled and will keep NetBird connected automatically.</div>
         </div>
       </div>
+      <div class="card" id="homeview">
+        <h2>Homeview</h2>
+        <p class="muted" id="homeview-status" aria-live="polite">Loading monitoring settings…</p>
+        <details id="homeview-details">
+          <summary>Choose what to monitor</summary>
+          <p class="muted">Enable Homeview for this home in the HomeTunnel portal first.
+            Find exact entity IDs in Home Assistant under Developer tools → States.</p>
+          <form id="homeview-form">
+            <div id="homeview-checks"></div>
+            <div class="actions">
+              <button type="button" class="secondary" id="homeview-add">Add check</button>
+              <button type="submit" id="homeview-review">Review sharing</button>
+              <button type="button" class="secondary" id="homeview-disable" hidden>Stop sharing</button>
+            </div>
+          </form>
+          <div id="homeview-preview" hidden>
+            <h3>What HomeTunnel receives</h3>
+            <p class="muted">The labels and check types below, an opaque ID per check,
+              check source, status and time, and battery percentages or entity report times when available.
+              The portal also receives report and session identifiers to validate and order reports.
+              Use labels you are comfortable sharing with this home’s owners.</p>
+            <ul id="homeview-shared"></ul>
+            <button type="button" id="homeview-apply">Enable and share these checks</button>
+          </div>
+          <p id="homeview-error" class="muted" role="alert"></p>
+        </details>
+      </div>
       <div class="card">
         <h2>Status</h2>
         <dl id="status"></dl>
@@ -6846,6 +6946,7 @@ def index() -> str:
       </div>
     </main>
     <script src="./app.js" defer></script>
+    <script src="./homeview.js" defer></script>
   </body>
 </html>
 """

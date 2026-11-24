@@ -62,6 +62,7 @@ heartbeat_payload
 heartbeat_payload_missing_target_observation
 heartbeat_send_failed
 heartbeat_target_observation_built
+homeview_settings_cleanup_failed
 ui_trusted_client_invalid
 invalid_pairing_transition
 local_bypass_recommended

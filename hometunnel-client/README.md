@@ -23,6 +23,12 @@ No setup is required — everything is provisioned automatically when you pair.
 | `log_level` | `info` | Structured event verbosity (`trace`, `debug`, `info`, `warn`, `error`). Raw tunnel output is disabled at every level. |
 | `allow_low_memory` | `false` | Bypass the startup memory check on hosts below the 2 GB minimum. **At your own risk** — under-provisioned hosts may run out of memory and become unresponsive. |
 
+## Homeview
+
+To share selected health checks with your home's owners, enable Homeview
+for the home in the portal, then choose and review the local checks in
+the HomeTunnel panel. See [Homeview setup and compatibility](HOMEVIEW.md).
+
 ## Links
 
 - [HomeTunnel](https://my.hometunnel.io)
