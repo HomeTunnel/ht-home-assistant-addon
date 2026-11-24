@@ -1,5 +1,9 @@
 # Changelog
 
+## 2.1.1 — TLS trust store update
+
+- Update the Python certificate trust bundle used for Homeview's HTTPS connection to the portal. The updated bundle removes the affected emSign root certificates.
+
 ## 2.1.0 — Homeview
 
 - Opt in from the add-on to share selected Home Assistant, entity, battery and LAN TCP checks with your home's Homeview in the portal. Reporting works while NetBird is disconnected.
