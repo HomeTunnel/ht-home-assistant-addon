@@ -8,7 +8,7 @@ import sys
 import tempfile
 import threading
 import unittest
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 
 import httpx
 import uvicorn
@@ -20,6 +20,7 @@ import test_client_recovery_state
 import app
 from safe_logging import EventFormatter
 from homeview import HomeviewRuntime
+from homeview_catalog import CatalogError, MAX_ENTRIES, core_lists
 from homeview_checks import RequestFailure, request_json
 
 
@@ -67,10 +68,10 @@ class RuntimeSecurityTests(unittest.IsolatedAsyncioTestCase):
                 "binding": {"binding_id": "a-binding"}, "netbird": {"connected": False},
             }
             runtime = HomeviewRuntime(pathlib.Path(directory) / "homeview.json", lambda: state)
-            with patch.object(app, "homeview", runtime):
+            with patch.object(app, "homeview", runtime), patch.object(app, "is_core_admin", new=AsyncMock(return_value=True)):
                 local = httpx.ASGITransport(app=app.app, client=("172.30.32.2", 4567))
                 overlay = httpx.ASGITransport(app=app.app, client=("192.0.2.47", 4567))
-                headers = {"X-Homeview-UI": "1"}
+                headers = {"X-Homeview-UI": "1", "X-Remote-User-Id": "a" * 32}
                 path = "/api/homeview/local"
                 async with httpx.AsyncClient(transport=overlay, base_url="http://addon") as client:
                     self.assertEqual((await client.get(path, headers=headers)).status_code, 403)
@@ -87,15 +88,18 @@ class RuntimeSecurityTests(unittest.IsolatedAsyncioTestCase):
                     self.assertEqual(response.headers["cache-control"], "private, no-store")
                     self.assertFalse(response.json()["enabled"])
                     enabled = {
-                        "enabled": True, "revision": response.json()["revision"],
-                        "monitors": [{"kind": "ha_api", "label": "Home Assistant"},
-                                     {"kind": "battery_binary", "label": "Sensor battery", "entity": "binary_sensor.test_battery"}],
+                        "revision": response.json()["revision"],
+                        "monitors": [{"kind": "ha_api", "label": "Home Assistant"}],
                     }
-                    saved = await client.post(path, json=enabled, headers=headers)
+                    self.assertEqual((await client.post(path, json=enabled, headers=headers)).status_code, 400)
+                    review = await client.post(path + "/preview", json=enabled, headers=headers)
+                    self.assertEqual(review.status_code, 200, review.text)
+                    confirmation = {"preview": review.json()["preview"]}
+                    saved = await client.post(path, json=confirmation, headers=headers)
                     self.assertEqual(saved.status_code, 200, saved.text)
                     self.assertTrue(saved.json()["enabled"])
                     self.assertNotIn("test-credential", saved.text)
-                    self.assertEqual((await client.post(path, json=enabled, headers=headers)).status_code, 409)
+                    self.assertEqual((await client.post(path, json=confirmation, headers=headers)).status_code, 409)
                     off = await client.post(path, json={"enabled": False}, headers=headers)
                     self.assertFalse(off.json()["enabled"])
 
@@ -106,30 +110,41 @@ class RuntimeSecurityTests(unittest.IsolatedAsyncioTestCase):
                 "device_id": "device", "device_token": "device-secret", "binding": {"binding_id": "binding-a"},
             }
             path = "/api/homeview/local"
-            headers = {"X-Homeview-UI": "1"}
+            headers = {"X-Homeview-UI": "1", "X-Remote-User-Id": "a" * 32}
             runtime = HomeviewRuntime(pathlib.Path(directory) / "homeview.json", lambda: state)
             ingress = httpx.ASGITransport(app=app.app, client=("172.30.32.2", 4567))
-            with patch.object(app, "homeview", runtime):
+            with patch.object(app, "homeview", runtime), patch.object(app, "is_core_admin", new=AsyncMock(return_value=True)):
                 async with httpx.AsyncClient(transport=ingress, base_url="http://addon", headers=headers) as client:
                     home_a = (await client.get(path)).json()
-                    preview = {"enabled": True, "revision": home_a["revision"],
-                               "monitors": [{"kind": "ha_api", "label": "Home A only"}]}
-                    self.assertFalse(home_a["enabled"])
-                    self.assertTrue(preview["revision"])
+                    preview_body = {"revision": home_a["revision"],
+                                    "monitors": [{"kind": "ha_api", "label": "Home A only"}]}
+                    review = await client.post(path + "/preview", json=preview_body)
+                    self.assertEqual(review.status_code, 200, review.text)
                     state.update(home_id="home-b", binding={"binding_id": "binding-b"})
-                    stale = await client.post(path, json=preview)
+                    stale = await client.post(path, json={"preview": review.json()["preview"]})
                     self.assertEqual(stale.status_code, 409)
                     home_b = (await client.get(path)).json()
                     self.assertNotEqual(home_a["revision"], home_b["revision"])
                     self.assertFalse(home_b["enabled"])
                     self.assertNotIn("Home A only", str(home_b))
-                    for revision in (None, preview["revision"]):
-                        self.assertEqual((await client.post(path, json={**preview, "revision": revision})).status_code, 409)
-                    self.assertFalse((await client.get(path)).json()["enabled"])
-                    fresh = await client.post(path, json={"enabled": True, "revision": home_b["revision"],
-                                                         "monitors": [{"kind": "ha_api", "label": "Home B"}]})
+                    self.assertEqual((await client.post(path + "/preview", json=preview_body)).status_code, 409)
+                    fresh = await client.post(path + "/preview", json={"revision": home_b["revision"],
+                                                                      "monitors": [{"kind": "ha_api", "label": "Home B"}]})
                     self.assertEqual(fresh.status_code, 200)
-                    self.assertTrue(fresh.json()["enabled"])
+                    confirmed = await client.post(path, json={"preview": fresh.json()["preview"]})
+                    self.assertTrue(confirmed.json()["enabled"])
+
+    async def test_homeview_uses_core_admin_and_rejects_spoofed_identity(self):
+        path = "/api/homeview/local"
+        headers = {"X-Homeview-UI": "1", "X-Remote-User-Id": "a" * 32, "X-Remote-User-Groups": "system-admin"}
+        deny = AsyncMock(return_value=False)
+        with patch.object(app, "is_core_admin", new=deny):
+            for source in ("127.0.0.1", "172.30.32.2"):
+                transport = httpx.ASGITransport(app=app.app, client=(source, 9999))
+                async with httpx.AsyncClient(transport=transport, base_url="http://addon") as client:
+                    self.assertEqual((await client.get(path, headers=headers)).status_code, 403)
+                    self.assertEqual((await client.get(path + "/discovery", headers={"X-Homeview-UI": "1"})).status_code, 403)
+            deny.assert_awaited_once_with("a" * 32)
 
     async def test_homeview_worker_reports_while_netbird_is_down(self):
         fixture_dir = pathlib.Path(__file__).with_name("fixtures") / "homeview_v1"
@@ -181,6 +196,115 @@ class RuntimeSecurityTests(unittest.IsolatedAsyncioTestCase):
                 ("/core/api/", "Bearer supervisor-secret"),
                 ("/api/devices/a-device/homeview/reports", "Bearer device-secret"),
             ])
+
+    async def test_supervisor_websocket_is_fixed_and_limits_inventory_without_truncation(self):
+        events = []
+
+        class CoreConnection:
+            def __init__(self, url, **kwargs):
+                self.assert_options(url, kwargs)
+                self.frames = iter([
+                    {"type": "auth_required"},
+                    {"type": "auth_ok"},
+                    {"type": "result", "id": 1, "success": True, "result": [None] * (MAX_ENTRIES + 1)},
+                ])
+
+            @staticmethod
+            def assert_options(url, options):
+                assert url == "ws://supervisor/core/websocket"
+                assert options["proxy"] is None and options["max_queue"] == 1
+                assert options["max_size"] > 65536
+
+            async def __aenter__(self):
+                redirect = ValueError("redirect")
+                assert self.process_redirect(redirect) is redirect
+                return self
+
+            async def __aexit__(self, *_):
+                return None
+
+            async def recv(self):
+                return json.dumps(next(self.frames))
+
+            async def send(self, data):
+                events.append(json.loads(data))
+
+        with patch("websockets.asyncio.client.connect", CoreConnection):
+            with self.assertRaisesRegex(CatalogError, "inventory_too_large"):
+                await core_lists(("get_states",), "local-token")
+            with self.assertRaisesRegex(ValueError, "unexpected_core_command"):
+                await core_lists(("call_service",), "local-token")
+        self.assertEqual(events, [
+            {"type": "auth", "access_token": "local-token"},
+            {"type": "get_states", "id": 1},
+        ])
+
+    async def test_homeview_v2_activation_and_tcp_only_report_use_negotiated_routes(self):
+        fixture_dir = pathlib.Path(__file__).with_name("fixtures") / "homeview_v2" / "fixtures"
+        inactive = json.loads((fixture_dir / "configBeforeActivation.json").read_text())
+        active = json.loads((fixture_dir / "config.json").read_text())
+        ack = threading.Event()
+        seen = []
+
+        def response(body, version=None):
+            headers = {"X-Homeview-Version": str(version)} if version else {}
+            return httpx.Response(200, headers=headers, stream=httpx.ByteStream(json.dumps(body).encode()))
+
+        async def route(request):
+            path = request.url.path
+            seen.append((request.method, path, request.headers.get("x-homeview-version")))
+            if request.url.host == "supervisor":
+                self.assertEqual(request.headers.get("authorization"), "Bearer supervisor-local")
+                self.assertEqual(path, "/network/info")
+                return response({"result": "ok", "data": {}})
+            self.assertEqual(request.headers.get("authorization"), "Bearer device-local")
+            self.assertEqual(request.headers.get("x-homeview-binding-id"), "test-binding")
+            self.assertEqual(request.headers.get("x-homeview-version"), "2")
+            self.assertNotIn("192.168.1.40", request.content.decode())
+            self.assertNotIn("supervisor-local", request.content.decode())
+            if path.endswith("/config"):
+                return response(inactive, 2)
+            document = json.loads(request.content)
+            if path.endswith("/activate"):
+                self.assertEqual(document["activationGeneration"], "pair-grant-1")
+                self.assertEqual(document["requestId"], committed.revision)
+                return response({**active, "manifestRevision": 0, "session": None}, 2)
+            if path.endswith("/monitors"):
+                self.assertEqual(document["monitors"], [{"id": committed.monitors[0].id, "kind": "tcp_service", "label": "Camera"}])
+                return response({**active, "session": {**active["session"], "bootId": document["bootId"]}}, 2)
+            if path.endswith("/reports"):
+                self.assertNotIn("entityApiStatus", document)
+                self.assertEqual(document["observations"][0]["reason"], "check_failed")
+                reply = json.loads((fixture_dir / "reportResponse.json").read_text())
+                ack.set()
+                return response(reply, 2)
+            raise AssertionError("unexpected route")
+
+        with tempfile.TemporaryDirectory() as directory, patch.dict("os.environ", {"SUPERVISOR_TOKEN": "supervisor-local"}):
+            state = {
+                "portal_base_url": "https://portal.example", "home_id": "home", "device_id": "device",
+                "device_token": "device-local", "binding": {"binding_id": "test-binding"},
+                "netbird": {"connected": False},
+            }
+            runtime = HomeviewRuntime(pathlib.Path(directory) / "homeview.json", lambda: state)
+            identity = runtime.identity()
+            initial = runtime.settings.get(identity, for_preview=True)
+            runtime.reporter.key = (identity, initial.revision)
+            runtime.reporter.accept_config(inactive)
+            review = runtime.preview("admin", {"revision": initial.revision, "monitors": [
+                {"kind": "tcp_service", "label": "Camera", "ip": "192.168.1.40", "port": 554}
+            ]})
+            runtime.confirm("admin", review["preview"])
+            committed = runtime.settings.get(identity)
+            create = httpx.AsyncClient
+            with patch("homeview.httpx.AsyncClient", side_effect=lambda **kwargs: create(transport=httpx.MockTransport(route), **kwargs)):
+                try:
+                    runtime.start()
+                    self.assertTrue(await asyncio.to_thread(ack.wait, 2), seen)
+                finally:
+                    runtime.stop()
+                    await asyncio.to_thread(runtime.thread.join, 2)
+        self.assertEqual([item[1].split("/")[-1] for item in seen], ["config", "activate", "monitors", "info", "reports"])
 
     async def test_homeview_transport_ignores_redirects_and_never_exposes_error_text(self):
         calls = []

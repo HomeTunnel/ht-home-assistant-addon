@@ -1,0 +1,18 @@
+{
+  "schemaVersion": 2,
+  "enabled": false,
+  "policy": {
+    "leaseSeconds": 180,
+    "reportIntervalSeconds": 60,
+    "staleAfterSeconds": 180,
+    "maxMonitors": 50,
+    "maxBodyBytes": 65536,
+    "maxObservationAgeSeconds": 120,
+    "maxFutureSkewSeconds": 30
+  },
+  "session": null,
+  "manifestRevision": 0,
+  "consentGeneration": null,
+  "decision": "never_enabled",
+  "activationGeneration": "pair-grant-1"
+}

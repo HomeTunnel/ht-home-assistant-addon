@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import asyncio
+from dataclasses import replace
 from datetime import datetime, timezone
 import ipaddress
 import json
@@ -9,6 +10,7 @@ import math
 import os
 import socket
 
+from homeview_catalog import CatalogError, entity_kind, resolve_registry
 from homeview_config import lan_ip, POLICY
 
 SUPERVISOR = "http://supervisor"
@@ -41,7 +43,7 @@ def parse_time(value):
         return None
 
 
-async def request_json(client, method, url, headers, content=None):
+async def request_json(client, method, url, headers, content=None, *, negotiated=False):
     async def read():
         async with client.stream(method, url, headers={**headers, "Accept": "application/json", "Accept-Encoding": "identity"},
                                  content=content, follow_redirects=False) as response:
@@ -60,6 +62,10 @@ async def request_json(client, method, url, headers, content=None):
                 raise RequestFailure(invalid_response=True) from None
             if not isinstance(parsed, dict):
                 raise RequestFailure(invalid_response=True)
+            if negotiated:
+                header = response.headers.get("X-Homeview-Version")
+                if header != str(parsed.get("schemaVersion")) and not (header is None and parsed.get("schemaVersion") == 1):
+                    raise RequestFailure(invalid_response=True)
             return parsed
     try:
         return await asyncio.wait_for(read(), CHECK_TIMEOUT)
@@ -89,6 +95,8 @@ def entity_observation(monitor, data, now=None):
         result = observation(monitor, "unknown", "no_signal", now)
     elif monitor.kind == "entity_availability":
         result = observation(monitor, "unavailable" if state == "unavailable" else "available", now=now)
+    elif monitor.kind in ("entity_contact", "entity_light", "entity_switch") and state in ("on", "off") and entity_kind(monitor.entity, attributes) == monitor.kind:
+        result = observation(monitor, {"on": "open", "off": "closed"}[state] if monitor.kind == "entity_contact" else state, now=now)
     elif monitor.kind == "entity_connectivity" and cls == "connectivity" and state in ("on", "off"):
         result = observation(monitor, "connected" if state == "on" else "disconnected", now=now)
     elif monitor.kind == "battery_binary" and cls == "battery" and state in ("on", "off"):
@@ -222,66 +230,123 @@ async def tcp_probe(ip, port, bridge_gateway):
 
 
 class Collector:
-    def __init__(self, client, read_token=None, probe=tcp_probe):
+    def __init__(self, client, read_token=None, probe=tcp_probe, registry=resolve_registry):
         self.client = client
         self.read_token = read_token or (lambda: os.environ.get("SUPERVISOR_TOKEN"))
         self.probe = probe
+        self.registry = registry
 
     async def collect(self, monitors, allowed):
-        token = self.read_token()
-        headers = {"Authorization": f"Bearer {token}"} if token else {}
-        ha = next(m for m in monitors if m.kind == "ha_api")
+        snapshot = await self.collect_v2(monitors, allowed)
+        return snapshot[0] if snapshot is not None else None
+
+    async def collect_v2(self, monitors, allowed):
         if not allowed():
             return None
-        if not token:
-            api = observation(ha, "configuration_error", "permission_denied")
-        else:
-            try:
-                response = await request_json(self.client, "GET", f"{SUPERVISOR}/core/api/", headers)
-                api = observation(ha, "responding") if response.get("message") == "API running." else observation(ha, "unknown", "check_failed")
-            except RequestFailure as exc:
-                if exc.status in (401, 403):
-                    api = observation(ha, "configuration_error", "permission_denied")
-                elif not exc.invalid_response and exc.status in (None, 502, 503, 504):
-                    api = observation(ha, "not_responding")
-                else:
-                    api = observation(ha, "unknown", "check_failed")
-
-        async def network():
-            if not token or not allowed() or not any(m.kind == "tcp_service" for m in monitors):
-                return None
-            try:
-                result = await request_json(self.client, "GET", f"{SUPERVISOR}/network/info", headers)
-                return lan_boundary(result["data"]) if result.get("result") == "ok" and isinstance(result.get("data"), dict) else None
-            except RequestFailure:
-                return None
-
-        boundary = await network()
+        token = self.read_token()
+        headers = {"Authorization": f"Bearer {token}"} if token else {}
+        ha = next((m for m in monitors if m.kind == "ha_api"), None)
+        api = await self.check_core(ha, headers) if ha else None
+        boundary = await self.network(monitors, headers) if token and allowed() else None
         slots = asyncio.Semaphore(CONCURRENCY)
+        selected = [monitor for monitor in monitors if monitor.entity is not None]
+        tracked = any(m.registry_id for m in selected)
+        can_read = token and (api is None or api["result"] == "responding")
+        before, after = None, None
+        registry_reason = "check_failed"
+        if tracked and can_read and allowed():
+            try:
+                before = await self.registry(token)
+            except CatalogError as exc:
+                if str(exc) == "permission_denied":
+                    registry_reason = "permission_denied"
 
-        async def measure(monitor):
-            if monitor.kind == "ha_api":
-                return api
+        def path_for(monitor):
+            if not monitor.registry_id:
+                return monitor.entity
+            pair = before.get(monitor.registry_id) if before is not None else None
+            return pair[1] if pair and pair[0] == monitor.device_id else None
+
+        async def read_entity(path):
             async with slots:
                 if not allowed():
-                    return observation(monitor, "unknown", "check_failed")
-                if monitor.kind == "tcp_service":
-                    if boundary is None:
-                        return observation(monitor, "unknown", "check_failed")
-                    if not safe_target(monitor.ip, boundary):
-                        return observation(monitor, "configuration_error", "unsafe_target")
-                    result, reason = await self.probe(monitor.ip, monitor.port, boundary[-1])
-                    return observation(monitor, result, reason)
-                if api["result"] != "responding":
-                    return observation(monitor, "unknown", "ha_api_unavailable")
+                    return None, RequestFailure(), datetime.now(timezone.utc)
                 try:
-                    response = await request_json(self.client, "GET", f"{SUPERVISOR}/core/api/states/{monitor.entity}", headers)
-                    return entity_observation(monitor, response)
+                    data = await request_json(self.client, "GET", f"{SUPERVISOR}/core/api/states/{path}", headers)
+                    return data, None, datetime.now(timezone.utc)
                 except RequestFailure as exc:
-                    if exc.status in (401, 403, 404):
-                        return observation(monitor, "configuration_error",
-                                           "entity_missing" if exc.status == 404 else "permission_denied")
-                    return observation(monitor, "unknown", "check_failed")
+                    return None, exc, datetime.now(timezone.utc)
 
-        values = await asyncio.gather(*(measure(monitor) for monitor in monitors))
-        return values if allowed() else None
+        async def tcp(monitor):
+            async with slots:
+                if not allowed() or boundary is None:
+                    return observation(monitor, "unknown", "check_failed")
+                if not safe_target(monitor.ip, boundary):
+                    return observation(monitor, "configuration_error", "unsafe_target")
+                result, reason = await self.probe(monitor.ip, monitor.port, boundary[-1])
+                return observation(monitor, result, reason)
+
+        paths = tuple(dict.fromkeys(path for m in selected if (path := path_for(m)))) if can_read else ()
+        tcp_monitors = [m for m in monitors if m.kind == "tcp_service"]
+        readings, tcp_values = await asyncio.gather(
+            asyncio.gather(*(read_entity(path) for path in paths)),
+            asyncio.gather(*(tcp(m) for m in tcp_monitors)),
+        )
+        by_path = dict(zip(paths, readings))
+        if tracked and before is not None and paths and allowed():
+            try:
+                # A concurrent replacement or rename must never expose the other entity's state.
+                after = await self.registry(token)
+            except CatalogError:
+                pass
+        evidence = any(data is not None or error.status == 404 for data, error, _ in readings)
+        values = dict(zip((m.id for m in tcp_monitors), tcp_values))
+        if ha:
+            values[ha.id] = api
+        for monitor in selected:
+            path = path_for(monitor)
+            if not token:
+                result = observation(monitor, "configuration_error", "permission_denied")
+            elif not can_read:
+                result = observation(monitor, "unknown", "ha_api_unavailable")
+            elif monitor.registry_id and before is None:
+                result = observation(monitor, "configuration_error" if registry_reason == "permission_denied" else "unknown", registry_reason)
+            elif not path:
+                result = observation(monitor, "configuration_error", "entity_missing")
+            elif monitor.registry_id and (after is None or after.get(monitor.registry_id) != before[monitor.registry_id]):
+                result = observation(monitor, "unknown", "check_failed")
+            else:
+                data, error, checked = by_path[path]
+                if data is not None:
+                    result = entity_observation(replace(monitor, entity=path), data, checked)
+                elif error.status in (401, 403, 404):
+                    result = observation(monitor, "configuration_error", "entity_missing" if error.status == 404 else "permission_denied", checked)
+                else:
+                    outage = error.status in (None, 502, 503, 504) and not error.invalid_response
+                    result = observation(monitor, "unknown", "ha_api_unavailable" if outage else "check_failed", checked)
+            values[monitor.id] = result
+        entity_api_status = ("responding" if evidence else "unavailable") if selected and not ha else None
+        return ([values[m.id] for m in monitors], entity_api_status) if allowed() else None
+
+    async def check_core(self, ha, headers):
+        if not headers:
+            return observation(ha, "configuration_error", "permission_denied")
+        try:
+            response = await request_json(self.client, "GET", f"{SUPERVISOR}/core/api/", headers)
+            if response.get("message") == "API running.":
+                return observation(ha, "responding")
+        except RequestFailure as exc:
+            if exc.status in (401, 403):
+                return observation(ha, "configuration_error", "permission_denied")
+            if not exc.invalid_response and exc.status in (None, 502, 503, 504):
+                return observation(ha, "not_responding")
+        return observation(ha, "unknown", "check_failed")
+
+    async def network(self, monitors, headers):
+        if not any(m.kind == "tcp_service" for m in monitors):
+            return None
+        try:
+            result = await request_json(self.client, "GET", f"{SUPERVISOR}/network/info", headers)
+        except RequestFailure:
+            return None
+        return lan_boundary(result["data"]) if result.get("result") == "ok" and isinstance(result.get("data"), dict) else None

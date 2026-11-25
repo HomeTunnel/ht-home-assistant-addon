@@ -1,0 +1,874 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://portal.hometunnel.io/contracts/homeview/v2/schema.json",
+  "$defs": {
+    "id": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9_-]{1,80}$"
+    },
+    "timestamp": {
+      "type": "string",
+      "format": "date-time",
+      "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(\\.[0-9]{1,3})?Z$"
+    },
+    "kind": {
+      "enum": [
+        "ha_api",
+        "entity_availability",
+        "entity_connectivity",
+        "battery_percent",
+        "battery_binary",
+        "tcp_service",
+        "entity_contact",
+        "entity_light",
+        "entity_switch"
+      ]
+    },
+    "source": {
+      "enum": [
+        "supervisor_core_api",
+        "home_assistant_entity",
+        "local_tcp"
+      ]
+    },
+    "result": {
+      "enum": [
+        "responding",
+        "not_responding",
+        "available",
+        "unavailable",
+        "connected",
+        "disconnected",
+        "reading",
+        "low",
+        "normal",
+        "unknown",
+        "configuration_error",
+        "open",
+        "closed",
+        "on",
+        "off"
+      ]
+    },
+    "reason": {
+      "enum": [
+        "no_signal",
+        "ha_api_unavailable",
+        "ha_starting",
+        "entity_missing",
+        "invalid_entity",
+        "permission_denied",
+        "unsafe_target",
+        "check_failed"
+      ]
+    },
+    "rule": {
+      "enum": [
+        "ha_api_unreachable",
+        "entity_unavailable",
+        "entity_disconnected",
+        "battery_low",
+        "tcp_unreachable",
+        "report_stale"
+      ]
+    },
+    "error": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "error"
+      ],
+      "properties": {
+        "error": {
+          "enum": [
+            "unauthorized",
+            "not_found",
+            "forbidden",
+            "paid_plan_required",
+            "terms_acceptance_required",
+            "unsupported",
+            "disabled",
+            "invalid_payload",
+            "request_too_large",
+            "rate_limited",
+            "session_conflict",
+            "manifest_conflict",
+            "sequence_conflict",
+            "invalid_time",
+            "unavailable",
+            "unsupported_version",
+            "activation_conflict"
+          ]
+        }
+      }
+    },
+    "settings": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "schemaVersion",
+        "enabled"
+      ],
+      "properties": {
+        "schemaVersion": {
+          "const": 2
+        },
+        "enabled": {
+          "type": "boolean"
+        }
+      }
+    },
+    "monitor": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "kind",
+        "label"
+      ],
+      "properties": {
+        "id": {
+          "$ref": "#/$defs/id"
+        },
+        "kind": {
+          "$ref": "#/$defs/kind"
+        },
+        "label": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 64
+        },
+        "lowThreshold": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 95
+        },
+        "entityGroupId": {
+          "$ref": "#/$defs/id"
+        },
+        "deviceGroupId": {
+          "$ref": "#/$defs/id"
+        }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "kind": {
+                "enum": [
+                  "entity_availability",
+                  "entity_connectivity",
+                  "battery_percent",
+                  "battery_binary",
+                  "entity_contact",
+                  "entity_light",
+                  "entity_switch"
+                ]
+              }
+            }
+          },
+          "then": {
+            "required": [
+              "entityGroupId"
+            ]
+          },
+          "else": {
+            "not": {
+              "anyOf": [
+                {
+                  "required": [
+                    "entityGroupId"
+                  ]
+                },
+                {
+                  "required": [
+                    "deviceGroupId"
+                  ]
+                }
+              ]
+            }
+          }
+        },
+        {
+          "if": {
+            "required": [
+              "lowThreshold"
+            ]
+          },
+          "then": {
+            "properties": {
+              "kind": {
+                "const": "battery_percent"
+              }
+            }
+          }
+        }
+      ]
+    },
+    "manifestRequest": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "schemaVersion",
+        "bootId",
+        "requestId",
+        "expectedRevision",
+        "enabled",
+        "monitors",
+        "consentGeneration"
+      ],
+      "properties": {
+        "schemaVersion": {
+          "const": 2
+        },
+        "bootId": {
+          "$ref": "#/$defs/id"
+        },
+        "requestId": {
+          "$ref": "#/$defs/id"
+        },
+        "expectedRevision": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 2147483647
+        },
+        "enabled": {
+          "type": "boolean"
+        },
+        "monitors": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/monitor"
+          },
+          "maxItems": 50
+        },
+        "consentGeneration": {
+          "$ref": "#/$defs/id"
+        }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "enabled": {
+                "const": true
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "monitors": {
+                "minItems": 1,
+                "contains": {
+                  "properties": {
+                    "kind": {
+                      "const": "ha_api"
+                    }
+                  }
+                },
+                "minContains": 0,
+                "maxContains": 1
+              }
+            }
+          },
+          "else": {
+            "properties": {
+              "monitors": {
+                "maxItems": 0
+              }
+            }
+          }
+        }
+      ]
+    },
+    "config": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "schemaVersion",
+        "enabled",
+        "policy",
+        "session",
+        "manifestRevision",
+        "consentGeneration",
+        "decision",
+        "activationGeneration"
+      ],
+      "properties": {
+        "schemaVersion": {
+          "const": 2
+        },
+        "enabled": {
+          "type": "boolean"
+        },
+        "policy": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "leaseSeconds",
+            "reportIntervalSeconds",
+            "staleAfterSeconds",
+            "maxMonitors",
+            "maxBodyBytes",
+            "maxObservationAgeSeconds",
+            "maxFutureSkewSeconds"
+          ],
+          "properties": {
+            "leaseSeconds": {
+              "const": 180
+            },
+            "reportIntervalSeconds": {
+              "const": 60
+            },
+            "staleAfterSeconds": {
+              "const": 180
+            },
+            "maxMonitors": {
+              "const": 50
+            },
+            "maxBodyBytes": {
+              "const": 65536
+            },
+            "maxObservationAgeSeconds": {
+              "const": 120
+            },
+            "maxFutureSkewSeconds": {
+              "const": 30
+            }
+          }
+        },
+        "session": {
+          "anyOf": [
+            {
+              "type": "object",
+              "additionalProperties": false,
+              "required": [
+                "id",
+                "bootId",
+                "nextSequence"
+              ],
+              "properties": {
+                "id": {
+                  "$ref": "#/$defs/id"
+                },
+                "bootId": {
+                  "$ref": "#/$defs/id"
+                },
+                "nextSequence": {
+                  "type": "integer",
+                  "minimum": 1,
+                  "maximum": 9007199254740991
+                }
+              }
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "manifestRevision": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 2147483647
+        },
+        "consentGeneration": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/id"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "decision": {
+          "$ref": "#/$defs/decision"
+        },
+        "activationGeneration": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/id"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      }
+    },
+    "observation": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "monitorId",
+        "checkedAt",
+        "source",
+        "result"
+      ],
+      "properties": {
+        "monitorId": {
+          "$ref": "#/$defs/id"
+        },
+        "checkedAt": {
+          "$ref": "#/$defs/timestamp"
+        },
+        "source": {
+          "$ref": "#/$defs/source"
+        },
+        "result": {
+          "$ref": "#/$defs/result"
+        },
+        "reason": {
+          "$ref": "#/$defs/reason"
+        },
+        "batteryPercent": {
+          "type": "number",
+          "minimum": 0,
+          "maximum": 100
+        },
+        "sourceReportedAt": {
+          "$ref": "#/$defs/timestamp"
+        }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "result": {
+                "enum": [
+                  "unknown",
+                  "configuration_error"
+                ]
+              }
+            }
+          },
+          "then": {
+            "required": [
+              "reason"
+            ]
+          },
+          "else": {
+            "not": {
+              "required": [
+                "reason"
+              ]
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "result": {
+                "const": "reading"
+              }
+            }
+          },
+          "then": {
+            "required": [
+              "batteryPercent"
+            ]
+          },
+          "else": {
+            "not": {
+              "required": [
+                "batteryPercent"
+              ]
+            }
+          }
+        },
+        {
+          "if": {
+            "required": [
+              "sourceReportedAt"
+            ]
+          },
+          "then": {
+            "properties": {
+              "source": {
+                "const": "home_assistant_entity"
+              }
+            }
+          }
+        }
+      ]
+    },
+    "reportRequest": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "schemaVersion",
+        "sessionId",
+        "manifestRevision",
+        "sequence",
+        "observedAt",
+        "observations"
+      ],
+      "properties": {
+        "schemaVersion": {
+          "const": 2
+        },
+        "sessionId": {
+          "$ref": "#/$defs/id"
+        },
+        "manifestRevision": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 2147483647
+        },
+        "sequence": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 9007199254740990
+        },
+        "observedAt": {
+          "$ref": "#/$defs/timestamp"
+        },
+        "observations": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/observation"
+          },
+          "maxItems": 50,
+          "minItems": 1
+        },
+        "entityApiStatus": {
+          "enum": [
+            "responding",
+            "unavailable"
+          ]
+        }
+      }
+    },
+    "reportResponse": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "schemaVersion",
+        "receivedAt",
+        "duplicate"
+      ],
+      "properties": {
+        "schemaVersion": {
+          "const": 2
+        },
+        "receivedAt": {
+          "$ref": "#/$defs/timestamp"
+        },
+        "duplicate": {
+          "type": "boolean"
+        }
+      }
+    },
+    "incident": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "monitorId",
+        "label",
+        "rule",
+        "firstObservedAt",
+        "confirmedAt"
+      ],
+      "properties": {
+        "id": {
+          "$ref": "#/$defs/id"
+        },
+        "monitorId": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/id"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "label": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 64
+        },
+        "rule": {
+          "$ref": "#/$defs/rule"
+        },
+        "firstObservedAt": {
+          "$ref": "#/$defs/timestamp"
+        },
+        "confirmedAt": {
+          "$ref": "#/$defs/timestamp"
+        }
+      }
+    },
+    "event": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "incident",
+        "type",
+        "observedAt",
+        "recordedAt"
+      ],
+      "properties": {
+        "id": {
+          "$ref": "#/$defs/id"
+        },
+        "incident": {
+          "$ref": "#/$defs/incident"
+        },
+        "type": {
+          "enum": [
+            "health.incident.opened",
+            "health.incident.resolved",
+            "health.incident.closed",
+            "health.monitoring.stale",
+            "health.monitoring.resumed"
+          ]
+        },
+        "observedAt": {
+          "$ref": "#/$defs/timestamp"
+        },
+        "recordedAt": {
+          "$ref": "#/$defs/timestamp"
+        },
+        "reason": {
+          "enum": [
+            "monitor_changed",
+            "monitor_removed",
+            "monitoring_paused",
+            "observer_changed"
+          ]
+        }
+      }
+    },
+    "home": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "name",
+        "enabled",
+        "status",
+        "observerName",
+        "receivedAt",
+        "observations",
+        "incidents",
+        "decision"
+      ],
+      "properties": {
+        "id": {
+          "$ref": "#/$defs/id"
+        },
+        "name": {
+          "type": "string"
+        },
+        "enabled": {
+          "type": "boolean"
+        },
+        "status": {
+          "enum": [
+            "disabled",
+            "unsupported",
+            "pending",
+            "stale",
+            "reporting"
+          ]
+        },
+        "observerName": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "receivedAt": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/timestamp"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "observations": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "monitor",
+              "observation",
+              "freshness",
+              "warning"
+            ],
+            "properties": {
+              "monitor": {
+                "anyOf": [
+                  {
+                    "$ref": "#/$defs/monitor"
+                  },
+                  {
+                    "$ref": "#/$defs/legacyMonitor"
+                  }
+                ]
+              },
+              "observation": {
+                "$ref": "#/$defs/observation"
+              },
+              "freshness": {
+                "enum": [
+                  "current",
+                  "last_known"
+                ]
+              },
+              "warning": {
+                "anyOf": [
+                  {
+                    "enum": [
+                      "unresponsive",
+                      "low_battery"
+                    ]
+                  },
+                  {
+                    "type": "null"
+                  }
+                ]
+              }
+            }
+          },
+          "maxItems": 50
+        },
+        "incidents": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/incident"
+          },
+          "maxItems": 51
+        },
+        "decision": {
+          "$ref": "#/$defs/decision"
+        }
+      }
+    },
+    "aggregate": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "schemaVersion",
+        "homes"
+      ],
+      "properties": {
+        "schemaVersion": {
+          "const": 2
+        },
+        "homes": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/home"
+          }
+        }
+      }
+    },
+    "history": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "schemaVersion",
+        "events",
+        "nextCursor"
+      ],
+      "properties": {
+        "schemaVersion": {
+          "const": 2
+        },
+        "events": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/event"
+          },
+          "maxItems": 50
+        },
+        "nextCursor": {
+          "anyOf": [
+            {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 256
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      }
+    },
+    "decision": {
+      "enum": [
+        "never_enabled",
+        "active",
+        "paused",
+        "deleted",
+        "owner_confirmation_required"
+      ]
+    },
+    "activationRequest": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "schemaVersion",
+        "requestId",
+        "activationGeneration"
+      ],
+      "properties": {
+        "schemaVersion": {
+          "const": 2
+        },
+        "requestId": {
+          "$ref": "#/$defs/id"
+        },
+        "activationGeneration": {
+          "$ref": "#/$defs/id"
+        }
+      }
+    },
+    "legacyMonitor": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "kind",
+        "label"
+      ],
+      "properties": {
+        "id": {
+          "$ref": "#/$defs/id"
+        },
+        "kind": {
+          "enum": [
+            "ha_api",
+            "entity_availability",
+            "entity_connectivity",
+            "battery_percent",
+            "battery_binary",
+            "tcp_service"
+          ]
+        },
+        "label": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 64
+        },
+        "lowThreshold": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 95
+        }
+      }
+    }
+  }
+}

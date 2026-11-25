@@ -1,0 +1,195 @@
+{
+  "schemaVersion": 2,
+  "homes": [
+    {
+      "id": "parents",
+      "name": "Parents’ home",
+      "enabled": true,
+      "status": "reporting",
+      "observerName": "HomeTunnel Client",
+      "receivedAt": "2026-11-24T19:12:00.000Z",
+      "observations": [
+        {
+          "monitor": {
+            "id": "door-available",
+            "kind": "entity_availability",
+            "label": "Front door",
+            "entityGroupId": "entity-door",
+            "deviceGroupId": "device-entry"
+          },
+          "observation": {
+            "monitorId": "door-available",
+            "checkedAt": "2026-11-24T19:12:00.000Z",
+            "source": "home_assistant_entity",
+            "result": "available"
+          },
+          "freshness": "current",
+          "warning": null
+        },
+        {
+          "monitor": {
+            "id": "door-contact",
+            "kind": "entity_contact",
+            "label": "Front door",
+            "entityGroupId": "entity-door",
+            "deviceGroupId": "device-entry"
+          },
+          "observation": {
+            "monitorId": "door-contact",
+            "checkedAt": "2026-11-24T19:12:00.000Z",
+            "source": "home_assistant_entity",
+            "result": "closed",
+            "sourceReportedAt": "2026-11-24T19:12:00.000Z"
+          },
+          "freshness": "current",
+          "warning": null
+        },
+        {
+          "monitor": {
+            "id": "light-available",
+            "kind": "entity_availability",
+            "label": "Hall light",
+            "entityGroupId": "entity-light"
+          },
+          "observation": {
+            "monitorId": "light-available",
+            "checkedAt": "2026-11-24T19:12:00.000Z",
+            "source": "home_assistant_entity",
+            "result": "available"
+          },
+          "freshness": "current",
+          "warning": null
+        },
+        {
+          "monitor": {
+            "id": "light-on-off",
+            "kind": "entity_light",
+            "label": "Hall light",
+            "entityGroupId": "entity-light"
+          },
+          "observation": {
+            "monitorId": "light-on-off",
+            "checkedAt": "2026-11-24T19:12:00.000Z",
+            "source": "home_assistant_entity",
+            "result": "off"
+          },
+          "freshness": "current",
+          "warning": null
+        },
+        {
+          "monitor": {
+            "id": "battery",
+            "kind": "battery_percent",
+            "label": "Entry battery",
+            "entityGroupId": "entity-battery",
+            "deviceGroupId": "device-entry"
+          },
+          "observation": {
+            "monitorId": "battery",
+            "checkedAt": "2026-11-24T19:12:00.000Z",
+            "source": "home_assistant_entity",
+            "result": "reading",
+            "batteryPercent": 18
+          },
+          "freshness": "current",
+          "warning": "low_battery"
+        },
+        {
+          "monitor": {
+            "id": "camera",
+            "kind": "tcp_service",
+            "label": "Camera port"
+          },
+          "observation": {
+            "monitorId": "camera",
+            "checkedAt": "2026-11-24T19:12:00.000Z",
+            "source": "local_tcp",
+            "result": "responding"
+          },
+          "freshness": "current",
+          "warning": null
+        }
+      ],
+      "incidents": [],
+      "decision": "active"
+    },
+    {
+      "id": "cottage",
+      "name": "Cottage",
+      "enabled": true,
+      "status": "reporting",
+      "observerName": "HomeTunnel Client",
+      "receivedAt": "2026-11-24T19:12:00.000Z",
+      "observations": [
+        {
+          "monitor": {
+            "id": "ha",
+            "kind": "ha_api",
+            "label": "Home Assistant"
+          },
+          "observation": {
+            "monitorId": "ha",
+            "checkedAt": "2026-11-24T19:12:00.000Z",
+            "source": "supervisor_core_api",
+            "result": "responding"
+          },
+          "freshness": "current",
+          "warning": null
+        },
+        {
+          "monitor": {
+            "id": "camera",
+            "kind": "tcp_service",
+            "label": "Camera port"
+          },
+          "observation": {
+            "monitorId": "camera",
+            "checkedAt": "2026-11-24T19:12:00.000Z",
+            "source": "local_tcp",
+            "result": "not_responding"
+          },
+          "freshness": "current",
+          "warning": null
+        }
+      ],
+      "incidents": [
+        {
+          "id": "camera-incident",
+          "monitorId": "camera",
+          "label": "Camera port",
+          "rule": "tcp_unreachable",
+          "firstObservedAt": "2026-11-24T19:10:00.000Z",
+          "confirmedAt": "2026-11-24T19:12:00.000Z"
+        }
+      ],
+      "decision": "active"
+    },
+    {
+      "id": "main",
+      "name": "Main home",
+      "enabled": true,
+      "status": "stale",
+      "observerName": "HomeTunnel Client",
+      "receivedAt": "2026-11-24T18:50:00.000Z",
+      "observations": [
+        {
+          "monitor": {
+            "id": "ha",
+            "kind": "ha_api",
+            "label": "Home Assistant"
+          },
+          "observation": {
+            "monitorId": "ha",
+            "checkedAt": "2026-11-24T18:50:00.000Z",
+            "source": "supervisor_core_api",
+            "result": "responding"
+          },
+          "freshness": "last_known",
+          "warning": null
+        }
+      ],
+      "incidents": [],
+      "decision": "active"
+    }
+  ]
+}

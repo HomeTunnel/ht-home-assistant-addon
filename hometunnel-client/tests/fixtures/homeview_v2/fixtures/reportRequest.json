@@ -1,0 +1,48 @@
+{
+  "schemaVersion": 2,
+  "sessionId": "session-1",
+  "manifestRevision": 1,
+  "sequence": 1,
+  "observedAt": "2026-11-24T19:12:00.000Z",
+  "observations": [
+    {
+      "monitorId": "door-available",
+      "checkedAt": "2026-11-24T19:12:00.000Z",
+      "source": "home_assistant_entity",
+      "result": "available"
+    },
+    {
+      "monitorId": "door-contact",
+      "checkedAt": "2026-11-24T19:12:00.000Z",
+      "source": "home_assistant_entity",
+      "result": "closed",
+      "sourceReportedAt": "2026-11-24T19:12:00.000Z"
+    },
+    {
+      "monitorId": "light-available",
+      "checkedAt": "2026-11-24T19:12:00.000Z",
+      "source": "home_assistant_entity",
+      "result": "available"
+    },
+    {
+      "monitorId": "light-on-off",
+      "checkedAt": "2026-11-24T19:12:00.000Z",
+      "source": "home_assistant_entity",
+      "result": "off"
+    },
+    {
+      "monitorId": "battery",
+      "checkedAt": "2026-11-24T19:12:00.000Z",
+      "source": "home_assistant_entity",
+      "result": "reading",
+      "batteryPercent": 18
+    },
+    {
+      "monitorId": "camera",
+      "checkedAt": "2026-11-24T19:12:00.000Z",
+      "source": "local_tcp",
+      "result": "responding"
+    }
+  ],
+  "entityApiStatus": "responding"
+}
