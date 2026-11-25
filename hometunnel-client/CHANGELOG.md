@@ -1,5 +1,11 @@
 # Changelog
 
+## 2.1.2 — Homeview V2
+
+- Choose available Home Assistant entities from a searchable device picker. Review the shared labels and choose whether to include supported values such as door, light, switch or battery status.
+- Enable the Home Assistant API check separately from entity monitoring and local TCP service checks.
+- Activate Homeview from the add-on when the portal owner grants permission during pairing. Existing V1 selections keep their sharing scope.
+
 ## 2.1.1 — TLS trust store update
 
 - Update the Python certificate trust bundle used for Homeview's HTTPS connection to the portal. The updated bundle removes the affected emSign root certificates.
