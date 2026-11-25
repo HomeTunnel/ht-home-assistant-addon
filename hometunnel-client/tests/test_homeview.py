@@ -345,7 +345,7 @@ class ReportingTests(unittest.IsolatedAsyncioTestCase):
         with patch("homeview.request_json", new=AsyncMock(side_effect=[fixture("config"), fixture("reportResponse")])) as request:
             portal = Portal(object(), IDENTITY)
             await portal.config()
-            await portal.report(b"{}")
+            await portal.report(b'{"schemaVersion":1}')
             for args in request.await_args_list:
                 url, headers = args.args[2:4]
                 self.assertTrue(url.startswith("https://portal.example/api/devices/device/homeview/"))

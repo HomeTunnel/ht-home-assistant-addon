@@ -41,6 +41,7 @@ from network_context import (
 )
 from heartbeat_payload import build_heartbeat_payload
 from homeview import HomeviewRuntime
+from homeview_catalog import CatalogError, MAX_ENTRIES, is_core_admin
 
 DATA_DIR = Path("/data")
 STATE_PATH = DATA_DIR / "state.json"
@@ -6683,56 +6684,115 @@ def api_agent_restart() -> JSONResponse:
     return JSONResponse({"ok": True, "started": True})
 
 
-def homeview_ui_request(request: Request) -> bool:
-    # Supervisor ingress protects the route; a custom header also prevents a
-    # cross-origin browser form from changing monitoring consent.
-    return (request.headers.get("x-homeview-ui") == "1"
-            and request.headers.get("sec-fetch-site") in (None, "same-origin"))
+_homeview_admin_slots = asyncio.Semaphore(2)
+
+
+async def homeview_admin(request: Request) -> str:
+    # Existing trusted-client overrides and loopback are deliberately excluded.
+    if (not request.client or request.client.host not in ("172.30.32.2", "::ffff:172.30.32.2")
+            or request.headers.get("x-homeview-ui") != "1"
+            or request.headers.get("sec-fetch-site") not in (None, "same-origin")):
+        raise CatalogError("permission_denied")
+    users = request.headers.getlist("x-remote-user-id")
+    if len(users) != 1 or not re.fullmatch(r"[a-f0-9]{32}", users[0]):
+        raise CatalogError("permission_denied")
+    # Older Supervisor versions authenticate the ID but forward caller-supplied group headers.
+    # Resolve the role from Core and use only the authenticated ingress ID as the lookup key.
+    try:
+        async with asyncio.timeout(8):
+            async with _homeview_admin_slots:
+                if await is_core_admin(users[0]):
+                    return users[0]
+    except TimeoutError:
+        raise CatalogError("core_unavailable") from None
+    raise CatalogError("permission_denied")
 
 
 def homeview_response(body: dict, status_code: int = 200) -> JSONResponse:
     return JSONResponse(body, status_code=status_code, headers={"Cache-Control": "private, no-store"})
 
 
-@app.get("/api/homeview/local")
-def api_homeview_get(request: Request) -> JSONResponse:
-    if not homeview_ui_request(request):
-        return homeview_response({"error": "forbidden"}, 403)
-    try:
-        return homeview_response(homeview.view())
-    except OSError:
+def homeview_error(exc) -> JSONResponse:
+    code = str(exc)
+    if isinstance(exc, CatalogError):
+        return homeview_response({"error": code}, 403 if code == "permission_denied" else 503)
+    if isinstance(exc, OSError):
         return homeview_response({"error": "settings_unavailable"}, 503)
+    if code in ("selection_changed", "inventory_expired", "v2_required"):
+        return homeview_response({"error": code}, 409)
+    return homeview_response({"error": "no_checks" if code == "no_checks" else "invalid_settings"}, 400)
+
+
+async def read_homeview_body(request):
+    async def read():
+        data = bytearray()
+        async for chunk in request.stream():
+            if len(data) + len(chunk) > 32768:
+                raise ValueError()
+            data.extend(chunk)
+        body = json.loads(data)
+        if not isinstance(body, dict):
+            raise ValueError()
+        return body
+
+    if request.headers.get("content-type", "").split(";", 1)[0].strip().lower() != "application/json":
+        return None
+    return await asyncio.wait_for(read(), 3)
+
+
+@app.get("/api/homeview/local")
+async def api_homeview_get(request: Request) -> JSONResponse:
+    try:
+        await homeview_admin(request)
+        return homeview_response(await asyncio.to_thread(homeview.view))
+    except (CatalogError, OSError) as exc:
+        return homeview_error(exc)
+
+
+@app.get("/api/homeview/local/discovery")
+async def api_homeview_discover(request: Request) -> JSONResponse:
+    try:
+        await homeview_admin(request)
+        query = request.query_params.get("q", "").strip()
+        offset = request.query_params.get("offset", "0")
+        if len(query) > 100 or not re.fullmatch(r"[0-9]{1,5}", offset) or int(offset) > MAX_ENTRIES:
+            raise ValueError()
+        async with asyncio.timeout(8):
+            return homeview_response(await homeview.discover(query.casefold(), int(offset)))
+    except TimeoutError:
+        return homeview_error(CatalogError("core_unavailable"))
+    except (CatalogError, ValueError, OSError) as exc:
+        return homeview_error(exc)
+
+
+@app.post("/api/homeview/local/preview")
+async def api_homeview_preview(request: Request) -> JSONResponse:
+    try:
+        user = await homeview_admin(request)
+        body = await read_homeview_body(request)
+        if body is None:
+            return homeview_response({"error": "invalid_settings"}, 415)
+        return homeview_response(homeview.preview(user, body))
+    except (CatalogError, ValueError, OSError, RecursionError, TimeoutError) as exc:
+        return homeview_error(exc)
 
 
 @app.post("/api/homeview/local")
 async def api_homeview_apply(request: Request) -> JSONResponse:
-    if not homeview_ui_request(request):
-        return homeview_response({"error": "forbidden"}, 403)
-    if request.headers.get("content-type", "").split(";", 1)[0].strip().lower() != "application/json":
-        return homeview_response({"error": "invalid_settings"}, 415)
-
-    async def read_settings():
-        data = bytearray()
-        async for chunk in request.stream():
-            if len(data) + len(chunk) > 32768:
-                raise ValueError("settings_too_large")
-            data.extend(chunk)
-        return json.loads(data)
-
     try:
-        body = await asyncio.wait_for(read_settings(), 3)
-    except (ValueError, RecursionError, asyncio.TimeoutError):
-        return homeview_response({"error": "invalid_settings"}, 400)
-    try:
-        await asyncio.to_thread(homeview.apply, body)
+        user = await homeview_admin(request)
+        body = await read_homeview_body(request)
+        if body is None:
+            return homeview_response({"error": "invalid_settings"}, 415)
+        if set(body) == {"enabled"} and body["enabled"] is False:
+            await asyncio.to_thread(homeview.apply, body)
+        elif set(body) == {"preview"} and isinstance(body["preview"], str) and re.fullmatch(r"[a-f0-9-]{36}", body["preview"]):
+            await asyncio.to_thread(homeview.confirm, user, body["preview"])
+        else:
+            raise ValueError()
         return homeview_response(await asyncio.to_thread(homeview.view))
-    except ValueError as exc:
-        code = str(exc)
-        if code == "selection_changed":
-            return homeview_response({"error": code}, 409)
-        return homeview_response({"error": "invalid_settings"}, 400)
-    except OSError:
-        return homeview_response({"error": "settings_unavailable"}, 503)
+    except (CatalogError, ValueError, OSError, RecursionError, TimeoutError) as exc:
+        return homeview_error(exc)
 
 
 @app.get("/homeview.js")
@@ -6849,7 +6909,10 @@ def index() -> str:
       #homeview label { display: inline-flex; flex-direction: column; gap: 4px; margin: 4px 8px 8px 0; max-width: 100%; }
       #homeview [hidden] { display: none; }
       #homeview input, #homeview select { font: inherit; max-width: 100%; }
-      #homeview-preview { margin-top: 12px; }
+      #homeview-preview, #homeview-picker { margin-top: 12px; }
+      #homeview input[type="checkbox"] { width: auto; }
+      #homeview select { min-width: 0; width: 100%; }
+      .homeview-item { border-bottom: 1px solid var(--line); padding: 8px 0; margin-bottom: 8px; }
       @media (max-width: 700px) {
         dl { grid-template-columns: 1fr; }
         .code { font-size: 26px; }
@@ -6911,22 +6974,43 @@ def index() -> str:
         <p class="muted" id="homeview-status" aria-live="polite">Loading monitoring settings…</p>
         <details id="homeview-details">
           <summary>Choose what to monitor</summary>
-          <p class="muted">Enable Homeview for this home in the HomeTunnel portal first.
-            Find exact entity IDs in Home Assistant under Developer tools → States.</p>
+          <p class="muted" id="homeview-portal-help"></p>
           <form id="homeview-form">
-            <div id="homeview-checks"></div>
+            <fieldset>
+              <legend>Home Assistant API</legend>
+              <label><span><input id="homeview-ha" type="checkbox"> Check whether the Home Assistant API responds</span></label>
+              <label id="homeview-ha-label-row">Shared label <input id="homeview-ha-label" maxlength="64"></label>
+            </fieldset>
+            <fieldset>
+              <legend>Devices and entities</legend>
+              <div id="homeview-entities"></div>
+              <button id="homeview-open-picker" type="button" class="secondary">Find an entity</button>
+              <div id="homeview-picker" hidden>
+                <label>Search devices or entities <input id="homeview-search" type="search" maxlength="100"></label>
+                <label>Available entities <select id="homeview-results"></select></label>
+                <div class="actions">
+                  <button id="homeview-previous" type="button" class="secondary">Previous page</button>
+                  <button id="homeview-next" type="button" class="secondary">Next page</button>
+                  <button id="homeview-pick" type="button" class="secondary">Add entity</button>
+                </div>
+                <p id="homeview-picker-status" class="muted" role="status"></p>
+              </div>
+            </fieldset>
+            <fieldset>
+              <legend>Local TCP services</legend>
+              <div id="homeview-services"></div>
+              <button id="homeview-add-tcp" type="button" class="secondary">Add TCP service</button>
+            </fieldset>
             <div class="actions">
-              <button type="button" class="secondary" id="homeview-add">Add check</button>
               <button type="submit" id="homeview-review">Review sharing</button>
               <button type="button" class="secondary" id="homeview-disable" hidden>Stop sharing</button>
             </div>
+            <p class="muted">Choose at least one check to enable monitoring.</p>
           </form>
           <div id="homeview-preview" hidden>
             <h3>What HomeTunnel receives</h3>
-            <p class="muted">The labels and check types below, an opaque ID per check,
-              check source, status and time, and battery percentages or entity report times when available.
-              The portal also receives report and session identifiers to validate and order reports.
-              Use labels you are comfortable sharing with this home’s owners.</p>
+            <p class="muted">Home owners see the labels and readings below, along with the source and check times.
+              Reports also include opaque IDs so HomeTunnel can group and order checks.</p>
             <ul id="homeview-shared"></ul>
             <button type="button" id="homeview-apply">Enable and share these checks</button>
           </div>

@@ -9,8 +9,9 @@ import time
 
 import httpx
 
+from homeview_catalog import Catalog
 from homeview_checks import Collector, RequestFailure, parse_time, request_json, stamp
-from homeview_config import Identity, POLICY, Settings, is_id, new_id
+from homeview_config import Identity, KINDS, POLICY, Settings, is_id, new_id, parse_monitors
 
 MAX_REVISION = 2147483647
 MAX_SEQUENCE = 9007199254740990
@@ -25,7 +26,7 @@ def encode(payload):
 
 
 def parse_config(data):
-    if (type(data.get("schemaVersion")) is not int or data["schemaVersion"] != 1
+    if (type(data.get("schemaVersion")) is not int or data["schemaVersion"] not in (1, 2)
             or type(data.get("enabled")) is not bool or data.get("policy") != POLICY
             or not integer(data.get("manifestRevision"), 0, MAX_REVISION)):
         raise RequestFailure()
@@ -38,6 +39,13 @@ def parse_config(data):
             not isinstance(session, dict) or not is_id(session.get("id")) or not is_id(session.get("bootId"))
             or not integer(session.get("nextSequence"), 1, MAX_SEQUENCE + 1) or data["manifestRevision"] == 0):
         raise RequestFailure()
+    if data["schemaVersion"] == 2:
+        decision, activation = data.get("decision"), data.get("activationGeneration")
+        if (decision not in ("never_enabled", "active", "paused", "deleted", "owner_confirmation_required")
+                or data["enabled"] != (decision == "active")
+                or "activationGeneration" not in data
+                or (activation is not None and (not is_id(activation) or decision != "never_enabled"))):
+            raise RequestFailure()
     return data
 
 
@@ -51,16 +59,31 @@ class Portal:
             "Content-Type": "application/json",
         }
 
+    async def request(self, method, route, *, body=None, version=2):
+        return await request_json(
+            self.client, method, self.base + route, {**self.headers, "X-Homeview-Version": str(version)},
+            body, negotiated=True,
+        )
+
     async def config(self):
-        return parse_config(await request_json(self.client, "GET", self.base + "config", self.headers))
+        return parse_config(await self.request("GET", "config"))
+
+    async def mutation(self, method, route, body):
+        version = json.loads(body)["schemaVersion"]
+        data = await self.request(method, route, body=body, version=version)
+        if type(data.get("schemaVersion")) is not int or data["schemaVersion"] != version:
+            raise RequestFailure(invalid_response=True)
+        return data
+
+    async def activate(self, body):
+        return parse_config(await self.mutation("POST", "activate", body))
 
     async def manifest(self, body):
-        return parse_config(await request_json(self.client, "PUT", self.base + "monitors", self.headers, body))
+        return parse_config(await self.mutation("PUT", "monitors", body))
 
     async def report(self, body):
-        data = await request_json(self.client, "POST", self.base + "reports", self.headers, body)
-        if (type(data.get("schemaVersion")) is not int or data["schemaVersion"] != 1
-                or not parse_time(data.get("receivedAt")) or type(data.get("duplicate")) is not bool):
+        data = await self.mutation("POST", "reports", body)
+        if not parse_time(data.get("receivedAt")) or type(data.get("duplicate")) is not bool:
             raise RequestFailure()
 
 
@@ -87,6 +110,8 @@ class Reporter:
         self.failures = 0
 
     def accept_config(self, config):
+        if self.config and self.config["schemaVersion"] != config["schemaVersion"]:
+            self.registered = self.manifest_pending = self.report_pending = None
         self.config = config
         now = self.clock()
         self.next_config = now + POLICY["reportIntervalSeconds"]
@@ -104,10 +129,10 @@ class Reporter:
         generation = config["consentGeneration"]
         if not self.manifest_pending or self.manifest_pending[0] != generation:
             body = encode({
-                "schemaVersion": 1, "bootId": self.boot, "requestId": new_id(),
+                "schemaVersion": config["schemaVersion"], "bootId": self.boot, "requestId": new_id(),
                 "consentGeneration": generation, "expectedRevision": config["manifestRevision"],
                 "enabled": selection.enabled,
-                "monitors": [monitor.manifest() for monitor in selection.monitors] if selection.enabled else [],
+                "monitors": [monitor.manifest(config["schemaVersion"]) for monitor in selection.monitors] if selection.enabled else [],
             })
             self.manifest_pending = generation, body
         if not current():
@@ -130,15 +155,15 @@ class Reporter:
         status = error.status
         self.failures += 1
         delay = min(60, 2 ** min(self.failures, 6)) + self.jitter()
-        if status in (401, 403, 404, 409):
+        if status in (401, 402, 403, 404, 406, 409):
             self.lease = 0
             self.config = None
             self.registered = None
             self.manifest_pending = None
             self.report_pending = None
             self.next_config = 0
-            self.status = {401: "pairing_required", 403: "portal_off", 404: "unsupported", 409: "waiting_portal"}[status]
-            if status in (401, 403, 404):
+            self.status = {401: "pairing_required", 402: "portal_off", 403: "portal_off", 404: "unsupported", 406: "unsupported", 409: "waiting_portal"}[status]
+            if status in (401, 402, 403, 404, 406):
                 delay = 60 + self.jitter()
         elif status == 422:
             # A rejected timestamp must not be retried as fresh evidence.
@@ -151,11 +176,11 @@ class Reporter:
         self.next_attempt = self.clock() + delay
 
     async def step(self, selection, identity, portal, collector, current, acknowledge_disable):
-        key = (identity, selection.revision) if identity and selection else None
+        key = (identity, selection.revision if selection else None) if identity else None
         if key != self.key:
             self.key = key
             self.reset()
-        if not key or (not selection.enabled and not selection.disable_pending):
+        if not key:
             self.status = "off"
             return
         if not current() or self.clock() < self.next_attempt:
@@ -166,11 +191,30 @@ class Reporter:
                 if not current():
                     return
                 self.accept_config(config)
+            if not selection or not (selection.enabled or selection.disable_pending):
+                self.status = "off"
+                self.failures = 0
+                return
+            version = self.config["schemaVersion"]
+            activation = self.config.get("activationGeneration")
+            if (version == 2 and selection.enabled and not self.config["enabled"] and activation
+                    and activation == getattr(selection, "activation_generation", None) and current()):
+                # The local selection revision is a persisted idempotency key.
+                answer = await portal.activate(encode({
+                    "schemaVersion": 2, "requestId": selection.revision, "activationGeneration": activation,
+                }))
+                if not current():
+                    return
+                self.accept_config(answer)
             if not self.config["enabled"]:
                 self.manifest_pending = None
-                self.status = "portal_off" if selection.enabled else "off"
+                self.status = self.config.get("decision", "portal_off") if selection.enabled else "off"
                 if not selection.enabled:
                     acknowledge_disable()
+                return
+            if selection.enabled and version == 1 and (not any(m.kind == "ha_api" for m in selection.monitors)
+                    or any(m.kind not in KINDS for m in selection.monitors)):
+                self.status = "v2_required"
                 return
             if not self.registered or self.next_sequence > MAX_SEQUENCE:
                 self.status = "waiting_portal"
@@ -196,21 +240,23 @@ class Reporter:
                     return
                 started = self.clock()
                 try:
-                    observations = await asyncio.wait_for(
-                        collector.collect(selection.monitors, allowed), max(0, self.lease - self.clock()),
-                    )
+                    collect = collector.collect_v2 if version == 2 else collector.collect
+                    snapshot = await asyncio.wait_for(collect(selection.monitors, allowed), max(0, self.lease - self.clock()))
                 except asyncio.TimeoutError:
                     return
-                if observations is None or not allowed():
+                if snapshot is None or not allowed():
                     return
+                observations, evidence = snapshot if version == 2 else (snapshot, None)
                 observed_at = self.wall()
-                # Do not send a report assembled across a backward wall-clock change.
-                if any(item["checkedAt"] > observed_at for item in observations):
+                # Core and transport stalls must not yield misleading or invalid timestamps.
+                observed_time = parse_time(observed_at)
+                if any(not 0 <= (observed_time - parse_time(item["checkedAt"])).total_seconds() <= 60 for item in observations):
                     raise RequestFailure(422)
                 body = encode({
-                    "schemaVersion": 1, "sessionId": self.registered[2],
+                    "schemaVersion": version, "sessionId": self.registered[2],
                     "manifestRevision": self.registered[1], "sequence": self.next_sequence,
                     "observedAt": observed_at, "observations": observations,
+                    **({"entityApiStatus": evidence} if evidence is not None else {}),
                 })
                 if len(body) > POLICY["maxBodyBytes"]:
                     raise RequestFailure(422)
@@ -240,6 +286,8 @@ class HomeviewRuntime:
         self.epoch = 0
         self.blocked_scope = None
         self.reporter = Reporter()
+        self.catalog = Catalog()
+        self.previews = {}
 
     def identity(self):
         return Identity.read(self.read_state())
@@ -260,12 +308,108 @@ class HomeviewRuntime:
             status = self.reporter.status
         elif selection and selection.disable_pending:
             status = "stopping"
+        config = self.portal_config(identity)
         return {
+            "protocol": config["schemaVersion"] if config else None,
+            "activationAvailable": bool(config and config.get("activationGeneration")),
+            "maxMonitors": POLICY["maxMonitors"],
             "paired": identity is not None, "enabled": bool(selection and selection.enabled),
             "revision": selection.revision if selection else None,
             "status": status,
-            "monitors": [m.local() for m in selection.monitors] if selection else [{"kind": "ha_api", "label": "Home Assistant"}],
+            "monitors": [
+                {**m.browser(), **({"selector": self.catalog.handle(identity.scope, m.registry_id)} if m.registry_id else {})}
+                for m in selection.monitors
+            ] if selection else [{"kind": "ha_api", "label": "Home Assistant"}],
         }
+
+    def portal_config(self, identity):
+        reporter = self.reporter
+        if identity and reporter.key and reporter.key[0] == identity and reporter.clock() < reporter.next_config:
+            return reporter.config
+
+    async def discover(self, query, offset):
+        identity, _, epoch = self._selection()
+        if not identity:
+            raise ValueError("selection_changed")
+        result = await self.catalog.page(identity.scope, query, offset)
+        if epoch != self.epoch or self.identity() != identity:
+            raise ValueError("selection_changed")
+        return result
+
+    def preview(self, user, body):
+        identity, current, epoch = self._selection(for_preview=True)
+        if not identity or not current or body.get("revision") != current.revision:
+            raise ValueError("selection_changed")
+        if set(body) != {"revision", "monitors"} or not isinstance(body["monitors"], list):
+            raise ValueError("invalid_settings")
+        if not body["monitors"]:
+            raise ValueError("no_checks")
+        if len(body["monitors"]) > POLICY["maxMonitors"]:
+            raise ValueError("invalid_settings")
+        rows = []
+        saved = {m.id: m for m in current.monitors}
+        for row in body["monitors"]:
+            if not isinstance(row, dict) or not isinstance(row.get("kind"), str):
+                raise ValueError("invalid_settings")
+            kind = row["kind"]
+            if kind in ("ha_api", "tcp_service"):
+                rows.append(row)
+                continue
+            if set(row) - {"kind", "label", "key", "saved", "lowThreshold"} or ("key" in row) == ("saved" in row):
+                raise ValueError("invalid_settings")
+            if "key" in row:
+                if not is_id(row["key"]):
+                    raise ValueError("invalid_settings")
+                candidate = self.catalog.lookup(identity.scope, row["key"])
+                if not candidate:
+                    raise ValueError("inventory_expired")
+                if kind not in ("entity_availability", candidate.kind):
+                    raise ValueError("invalid_settings")
+                entity, registry, device = candidate.entity, candidate.registry, candidate.device
+            else:
+                prior = saved.get(row["saved"]) if is_id(row["saved"]) else None
+                if not prior or not prior.entity or prior.kind != kind:
+                    raise ValueError("invalid_settings")
+                entity, registry, device = prior.entity, prior.registry_id, prior.device_id
+            fields = {"kind": kind, "label": row.get("label"), "entity": entity}
+            if registry:
+                fields.update(registryId=registry, deviceId=device)
+            if "lowThreshold" in row:
+                fields["lowThreshold"] = row["lowThreshold"]
+            rows.append(fields)
+        monitors = parse_monitors(rows, current.monitors, v2=True)
+        self.settings.validate_labels(identity, monitors)
+        config = self.portal_config(identity)
+        v1_compatible = any(m.kind == "ha_api" for m in monitors) and all(m.kind in KINDS for m in monitors)
+        if not v1_compatible and (not config or config["schemaVersion"] != 2):
+            raise ValueError("v2_required")
+        deadline = time.monotonic() + 120
+        token = new_id()
+        activation = config.get("activationGeneration") if config else None
+        with self.lock:
+            if epoch != self.epoch or self.identity() != identity:
+                raise ValueError("selection_changed")
+            # Keep a bounded number of short-lived previews across browser tabs.
+            self.previews = {key: preview for key, preview in self.previews.items() if preview[0] > time.monotonic()}
+            if len(self.previews) >= 8:
+                self.previews.pop(next(iter(self.previews)))
+            self.previews[token] = (deadline, user, identity, current.revision, monitors, activation)
+        return {"preview": token, "monitors": [
+            {key: value for key, value in m.manifest().items() if key != "id"} for m in monitors
+        ]}
+
+    def confirm(self, user, token):
+        with self.lock:
+            identity = self.identity()
+            pending = self.previews.pop(token, None)
+            if (not pending or pending[0] <= time.monotonic() or pending[1] != user or pending[2] != identity
+                    or identity.scope == self.blocked_scope):
+                raise ValueError("selection_changed")
+            _, _, _, revision, monitors, activation = pending
+            self.settings.commit(identity, revision, monitors, activation)
+            self.epoch += 1
+            self.previews.clear()
+        self.interrupt()
 
     def apply(self, body):
         with self.lock:
@@ -273,6 +417,7 @@ class HomeviewRuntime:
             if identity and identity.scope == self.blocked_scope:
                 identity = None
             self.settings.apply(identity, body)
+            self.previews.clear()
             self.epoch += 1
         self.interrupt()
 
@@ -280,6 +425,7 @@ class HomeviewRuntime:
         with self.lock:
             identity = self.identity()
             self.blocked_scope = identity.scope if identity else None
+            self.previews.clear()
             self.epoch += 1
             try:
                 self.settings.clear()

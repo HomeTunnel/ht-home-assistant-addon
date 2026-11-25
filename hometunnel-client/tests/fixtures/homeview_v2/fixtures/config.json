@@ -1,0 +1,22 @@
+{
+  "schemaVersion": 2,
+  "enabled": true,
+  "policy": {
+    "leaseSeconds": 180,
+    "reportIntervalSeconds": 60,
+    "staleAfterSeconds": 180,
+    "maxMonitors": 50,
+    "maxBodyBytes": 65536,
+    "maxObservationAgeSeconds": 120,
+    "maxFutureSkewSeconds": 30
+  },
+  "session": {
+    "id": "session-1",
+    "bootId": "boot-1",
+    "nextSequence": 1
+  },
+  "manifestRevision": 1,
+  "consentGeneration": "consent-1",
+  "decision": "active",
+  "activationGeneration": null
+}

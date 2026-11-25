@@ -16,6 +16,8 @@ from uuid import uuid4
 ID = re.compile(r"[A-Za-z0-9_-]{1,80}")
 ENTITY = re.compile(r"[a-z0-9_]{1,64}\.[a-z0-9_]{1,190}")
 KINDS = {"ha_api", "entity_availability", "entity_connectivity", "battery_percent", "battery_binary", "tcp_service"}
+V2_KINDS = {"entity_contact", "entity_light", "entity_switch"}
+CONTACT_CLASSES = {"door", "window", "opening", "garage_door"}
 PRIVATE = tuple(ipaddress.IPv4Network(net) for net in ("10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16"))
 POLICY = {
     "leaseSeconds": 180, "reportIntervalSeconds": 60, "staleAfterSeconds": 180,
@@ -98,30 +100,50 @@ class Monitor:
     ip: str | None = field(default=None, repr=False)
     port: int | None = field(default=None, repr=False)
     low_threshold: int | None = None
+    registry_id: str | None = field(default=None, repr=False)
+    device_id: str | None = field(default=None, repr=False)
+    entity_group: str | None = None
+    device_group: str | None = None
 
     @property
     def target(self):
-        return (self.kind, self.entity, self.ip, self.port)
+        return (self.kind, self.registry_id or self.entity, self.ip, self.port)
 
-    def manifest(self):
+    def manifest(self, version=1):
         fields = {"id": self.id, "kind": self.kind, "label": self.label}
         if self.low_threshold is not None:
             fields["lowThreshold"] = self.low_threshold
+        if version == 2 and self.entity is not None:
+            fields["entityGroupId"] = self.entity_group
+            if self.device_group is not None:
+                fields["deviceGroupId"] = self.device_group
         return fields
 
-    def local(self):
+    def browser(self):
         fields = self.manifest()
+        if self.entity_group:
+            fields["entityGroupId"] = self.entity_group
+        if self.ip is not None:
+            fields.update(ip=self.ip, port=self.port)
+        return fields
+
+    def local(self, version=1):
+        fields = self.manifest(version)
         if self.entity is not None:
             fields["entity"] = self.entity
+            if self.registry_id is not None:
+                fields.update(registryId=self.registry_id, deviceId=self.device_id)
         if self.ip is not None:
             fields.update(ip=self.ip, port=self.port)
         return fields
 
 
-def parse_monitors(value, previous=(), *, stored=False):
+def parse_monitors(value, previous=(), *, stored=False, v2=False):
     if not isinstance(value, list) or not 1 <= len(value) <= POLICY["maxMonitors"]:
         raise ValueError("invalid_monitors")
-    known = {item.target: item.id for item in previous}
+    known = {item.target: item for item in previous}
+    entity_groups = {m.registry_id: m.entity_group for m in previous if m.registry_id}
+    device_groups = {m.device_id: m.device_group for m in previous if m.device_id}
     monitors = []
     for row in value:
         if not isinstance(row, dict):
@@ -129,7 +151,7 @@ def parse_monitors(value, previous=(), *, stored=False):
         fields = dict(row)
         monitor_id = fields.pop("id", None) if stored else None
         kind, label = fields.pop("kind", None), fields.pop("label", None)
-        if not isinstance(kind, str) or kind not in KINDS:
+        if not isinstance(kind, str) or kind not in (KINDS | V2_KINDS if v2 else KINDS):
             raise ValueError("invalid_kind")
         if (not isinstance(label, str) or not 1 <= len(label) <= 64 or label.strip() != label
                 or any(unicodedata.category(c) == "Cc" or "\u202a" <= c <= "\u202e" or "\u2066" <= c <= "\u2069" for c in label)):
@@ -137,7 +159,8 @@ def parse_monitors(value, previous=(), *, stored=False):
         # Labels are the only free text transmitted. Catch common pasted secrets/URLs.
         if re.search(r"://|(?i:\bbearer\s)|[A-Za-z0-9_-]{16,}\.[A-Za-z0-9_-]{16,}\.", label):
             raise ValueError("invalid_label")
-        entity = ip = port = low = None
+        label.encode("utf-8", errors="strict")
+        entity = ip = port = low = registry = device = group = device_group = None
         if kind == "tcp_service":
             ip, port = fields.pop("ip", None), fields.pop("port", None)
             if lan_ip(ip) is None or type(port) is not int or not 1 <= port <= 65535:
@@ -150,17 +173,44 @@ def parse_monitors(value, previous=(), *, stored=False):
             if ((kind == "battery_percent" and domain != "sensor")
                     or (kind in ("battery_binary", "entity_connectivity") and domain != "binary_sensor")):
                 raise ValueError("invalid_entity")
+            if v2:
+                registry, device = fields.pop("registryId", None), fields.pop("deviceId", None)
+                if (registry is not None or device is not None) and not (is_id(registry) and is_id(device)):
+                    raise ValueError("invalid_entity")
+                if kind in V2_KINDS and (not registry or domain != {
+                    "entity_contact": "binary_sensor", "entity_light": "light", "entity_switch": "switch",
+                }[kind]):
+                    raise ValueError("invalid_entity")
+            if stored:
+                group = fields.pop("entityGroupId", None)
+                device_group = fields.pop("deviceGroupId", None)
+                if (group is not None and not is_id(group)) or (device_group is not None and not is_id(device_group)):
+                    raise ValueError("invalid_monitor")
             if kind == "battery_percent" and "lowThreshold" in fields:
                 low = fields.pop("lowThreshold")
                 if type(low) is not int or not 0 <= low <= 95:
                     raise ValueError("invalid_threshold")
         if fields or (stored and not is_id(monitor_id)):
             raise ValueError("invalid_monitor")
-        target = (kind, entity, ip, port)
-        monitors.append(Monitor(monitor_id or known.get(target) or new_id(), kind, label, entity, ip, port, low))
-    if (sum(m.kind == "ha_api" for m in monitors) != 1 or len({m.target for m in monitors}) != len(monitors)
-            or len({m.id for m in monitors}) != len(monitors)):
+        old = known.get((kind, registry or entity, ip, port))
+        identifier = monitor_id or (old.id if old and old.device_id == device else new_id())
+        if registry:
+            group = entity_groups.setdefault(registry, group or new_id())
+            device_group = device_groups.setdefault(device, device_group or new_id())
+        elif entity:
+            # Legacy monitors have no proven registry identity. Reuse the previously
+            # generated opaque monitor ID as their group on a V2 wire session.
+            group = group or identifier
+        monitors.append(Monitor(identifier, kind, label, entity, ip, port, low, registry, device, group, device_group))
+    ha_count = sum(m.kind == "ha_api" for m in monitors)
+    if (ha_count > 1 or (not v2 and ha_count != 1) or len({m.target for m in monitors}) != len(monitors)
+            or len({m.id for m in monitors}) != len(monitors)
+            or len({(m.kind, m.entity, m.ip, m.port) for m in monitors}) != len(monitors)):
         raise ValueError("duplicate_or_missing_monitor")
+    for group in {m.entity_group for m in monitors if m.entity_group}:
+        kinds = [m.kind for m in monitors if m.entity_group == group]
+        if kinds.count("entity_availability") > 1 or sum(k != "entity_availability" for k in kinds) > 1:
+            raise ValueError("duplicate_or_missing_monitor")
     return tuple(monitors)
 
 
@@ -171,6 +221,8 @@ class Selection:
     enabled: bool
     disable_pending: bool
     monitors: tuple[Monitor, ...]
+    activation_generation: str | None = None
+
 
 
 class Settings:
@@ -186,8 +238,11 @@ class Settings:
             if identity is not None and saved["scope"] == list(identity.scope):
                 if not is_id(saved["revision"]) or type(saved["enabled"]) is not bool or type(saved["disable_pending"]) is not bool:
                     raise ValueError()
+                activation = saved.get("activation_generation")
+                if activation is not None and not is_id(activation):
+                    raise ValueError()
                 return Selection(identity.scope, saved["revision"], saved["enabled"], saved["disable_pending"],
-                                 parse_monitors(saved["monitors"], stored=True))
+                                 parse_monitors(saved["monitors"], stored=True, v2=True), activation)
         except FileNotFoundError:
             return None
         except (ValueError, KeyError, TypeError, RecursionError):
@@ -207,13 +262,16 @@ class Settings:
 
     def _write(self, selection):
         self.path.parent.mkdir(parents=True, exist_ok=True)
+        v2 = (not any(m.kind == "ha_api" for m in selection.monitors) or
+              any(m.registry_id or m.kind in V2_KINDS for m in selection.monitors))
         fd, temp = tempfile.mkstemp(prefix=".homeview-", dir=self.path.parent)
         try:
             with os.fdopen(fd, "w", encoding="utf-8") as handle:
                 json.dump({
                     "scope": list(selection.scope), "revision": selection.revision,
                     "enabled": selection.enabled, "disable_pending": selection.disable_pending,
-                    "monitors": [item.local() for item in selection.monitors],
+                    "monitors": [item.local(2 if v2 else 1) for item in selection.monitors],
+                    "activation_generation": selection.activation_generation,
                 }, handle, ensure_ascii=False)
                 handle.flush()
                 os.fsync(handle.fileno())
@@ -237,18 +295,33 @@ class Settings:
             if current is None or body["revision"] != current.revision:
                 raise ValueError("selection_changed")
             monitors = parse_monitors(body["monitors"], current.monitors)
-            # A label should never copy a local target or the device credential.
-            private = {identity.token, *(m.entity for m in monitors if m.entity), *(m.ip for m in monitors if m.ip)}
-            supervisor_token = os.environ.get("SUPERVISOR_TOKEN")
-            if supervisor_token:
-                private.add(supervisor_token)
-            if any(secret in m.label for secret in private for m in monitors):
-                raise ValueError("invalid_label")
-            if current.enabled and current.monitors == monitors:
-                return current
-            selected = Selection(identity.scope, new_id(), True, False, monitors)
-            self._write(selected)
-            return selected
+            self.validate_labels(identity, monitors)
+            return self._commit(current, monitors, None)
+
+    @staticmethod
+    def validate_labels(identity, monitors):
+        private = {identity.token, *(m.entity for m in monitors if m.entity), *(m.ip for m in monitors if m.ip),
+                   *(m.registry_id for m in monitors if m.registry_id), *(m.device_id for m in monitors if m.device_id)}
+        supervisor_token = os.environ.get("SUPERVISOR_TOKEN")
+        if supervisor_token:
+            private.add(supervisor_token)
+        if any(secret in m.label for secret in private for m in monitors):
+            raise ValueError("invalid_label")
+
+    def _commit(self, current, monitors, activation):
+        if current.enabled and current.monitors == monitors and current.activation_generation == activation:
+            return current
+        selected = Selection(current.scope, new_id(), True, False, monitors, activation)
+        self._write(selected)
+        return selected
+
+    def commit(self, identity, revision, monitors, activation):
+        with self.lock:
+            current = self._read(identity)
+            if current is None or current.revision != revision:
+                raise ValueError("selection_changed")
+            self.validate_labels(identity, monitors)
+            return self._commit(current, monitors, activation)
 
     def acknowledge_disable(self, identity, revision):
         with self.lock:
