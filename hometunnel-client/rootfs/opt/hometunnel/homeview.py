@@ -195,6 +195,14 @@ class Reporter:
                 self.status = "off"
                 self.failures = 0
                 return
+            if selection.enabled:
+                try:
+                    Settings.validate_labels(identity, selection.monitors)
+                except ValueError:
+                    self.status = "review_labels"
+                    self.report_pending = None
+                    self.next_attempt = self.clock() + POLICY["reportIntervalSeconds"]
+                    return
             version = self.config["schemaVersion"]
             activation = self.config.get("activationGeneration")
             if (version == 2 and selection.enabled and not self.config["enabled"] and activation

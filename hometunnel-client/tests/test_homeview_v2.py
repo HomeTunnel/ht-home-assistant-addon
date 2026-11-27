@@ -182,6 +182,35 @@ class CollectorTests(unittest.IsolatedAsyncioTestCase):
 
 
 class SettingsAndProtocolTests(unittest.IsolatedAsyncioTestCase):
+    async def test_addresses_are_blocked_at_preview_and_before_sending_saved_labels(self):
+        with tempfile.TemporaryDirectory() as directory:
+            runtime = HomeviewRuntime(Path(directory) / "homeview.json", pairing)
+            runtime.catalog = Catalog(AsyncMock(return_value=(DEVICES, REGISTRY, STATES)))
+            revision = runtime.view()["revision"]
+            item = (await runtime.discover("binary_sensor.front", 0))["items"][0]
+            monitor = {"key": item["key"], "kind": "entity_availability"}
+            for label in ("Garage camera 192.0.2.41", "Camera [2001:db8::41]:8123",
+                          "Camera fd00::", "Camera camera.local", "Camera １９２.０.２.４１"):
+                with self.subTest(label=label), self.assertRaisesRegex(ValueError, "address_in_label"):
+                    runtime.preview("admin", {"revision": revision, "monitors": [{**monitor, "label": label}]})
+
+        portal = FakePortal()
+        portal.value = fixture("configBeforeActivation")
+        portal.activate = AsyncMock()
+        reporter = Reporter(lambda: 0, jitter=lambda: 0)
+        selection = type("Selection", (), {
+            "revision": "old", "enabled": True, "disable_pending": False,
+            "monitors": (replace(MONITORS[0], label="Camera 192.0.2.41"),),
+            "activation_generation": "pair-grant-1",
+        })()
+        collector = AsyncMock()
+        await reporter.step(selection, IDENTITY, portal, collector, lambda: True, lambda: None)
+        self.assertEqual(reporter.status, "review_labels")
+        portal.activate.assert_not_awaited()
+        self.assertEqual(portal.manifests, [])
+        self.assertEqual(portal.reports, [])
+        collector.collect_v2.assert_not_awaited()
+
     async def test_exact_preview_does_not_select_siblings_and_binds_admin_and_pairing(self):
         with tempfile.TemporaryDirectory() as directory:
             state_file = Path(directory) / "homeview.json"

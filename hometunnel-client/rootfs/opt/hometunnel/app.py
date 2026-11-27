@@ -6720,6 +6720,8 @@ def homeview_error(exc) -> JSONResponse:
         return homeview_response({"error": "settings_unavailable"}, 503)
     if code in ("selection_changed", "inventory_expired", "v2_required"):
         return homeview_response({"error": code}, 409)
+    if code == "address_in_label":
+        return homeview_response({"error": code}, 400)
     return homeview_response({"error": "no_checks" if code == "no_checks" else "invalid_settings"}, 400)
 
 

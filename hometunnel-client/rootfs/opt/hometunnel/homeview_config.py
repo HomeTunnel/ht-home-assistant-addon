@@ -33,6 +33,21 @@ def is_id(value) -> bool:
     return isinstance(value, str) and ID.fullmatch(value) is not None
 
 
+def contains_network_address(label):
+    label = unicodedata.normalize("NFKC", label)
+    if re.search(r"\b(?:[0-9]{1,3}\.){3}[0-9]{1,3}\b", label):
+        return True
+    if re.search(r"\b(?:[a-z0-9-]+\.)+[a-z][a-z0-9-]*\b", label, re.IGNORECASE):
+        return True
+    for candidate in re.findall(r"[0-9a-f:.]*:[0-9a-f:.]+|[0-9a-f:.]*::", label, re.IGNORECASE):
+        try:
+            ipaddress.IPv6Address(candidate.rstrip("."))
+        except ValueError:
+            continue
+        return True
+    return False
+
+
 def lan_ip(value):
     if not isinstance(value, str):
         return None
@@ -307,6 +322,8 @@ class Settings:
             private.add(supervisor_token)
         if any(secret in m.label for secret in private for m in monitors):
             raise ValueError("invalid_label")
+        if any(contains_network_address(m.label) for m in monitors):
+            raise ValueError("address_in_label")
 
     def _commit(self, current, monitors, activation):
         if current.enabled and current.monitors == monitors and current.activation_generation == activation:

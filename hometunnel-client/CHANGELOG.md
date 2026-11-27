@@ -1,5 +1,10 @@
 # Changelog
 
+## 2.1.3 — Homeview privacy and arm64 build
+
+- Cross-compile NetBird for arm64 without emulating the compiler that crashed during the 2.1.2 build.
+- Keep discovered names local. Enter a shared label without IP addresses or hostnames before enabling a new entity check.
+
 ## 2.1.2 — Homeview V2
 
 - Choose available Home Assistant entities from a searchable device picker. Review the shared labels and choose whether to include supported values such as door, light, switch or battery status.

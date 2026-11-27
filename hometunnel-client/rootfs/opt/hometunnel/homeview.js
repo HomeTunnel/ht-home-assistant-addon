@@ -31,6 +31,7 @@ document.addEventListener("DOMContentLoaded", () => {
     v2_required: "These checks require a Homeview V2 portal.",
     pairing_required: "Check this add-on’s pairing in HomeTunnel.",
     clock_error: "Check the Home Assistant system clock.",
+    review_labels: "Review your shared labels to resume reporting. Remove any addresses or private identifiers.",
   };
   const errors = {
     permission_denied: "Homeview requires an administrator signed in through Home Assistant.",
@@ -41,6 +42,7 @@ document.addEventListener("DOMContentLoaded", () => {
     v2_required: "The portal must support Homeview V2 to save these checks.",
     no_checks: "Choose at least one entity, TCP service, or Home Assistant API check.",
     invalid_settings: "Review the check labels, entity selections, and TCP addresses or ports.",
+    address_in_label: "Remove IP addresses or hostnames from shared labels.",
   };
   let selected;
   let preview;
@@ -104,7 +106,7 @@ document.addEventListener("DOMContentLoaded", () => {
 
   function entityRow(key, name, monitors, candidate) {
     const row = item(entities, name, () => entityRows.delete(key));
-    const label = input(monitors[0]?.label ?? (candidate ? Array.from(candidate.name).slice(0, 64).join("") : ""), { required: true, maxLength: 64 });
+    const label = input(monitors[0]?.label, { required: true, maxLength: 64 });
     field(row, "Shared label", label);
     const typed = monitors.find((m) => m.kind !== "entity_availability");
     const availability = monitors.find((m) => m.kind === "entity_availability");

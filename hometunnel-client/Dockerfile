@@ -2,7 +2,7 @@ ARG BUILD_FROM=ghcr.io/hassio-addons/base:21.0.5
 
 # Rebuild the pinned client with the reviewed dependency lock: upstream 0.78.2
 # binaries still contain gRPC 1.80.0, which has fixed high-severity advisories.
-FROM golang:1.26.8-alpine3.24 AS netbird-build
+FROM --platform=$BUILDPLATFORM golang:1.26.8-alpine3.24 AS netbird-build
 ARG NETBIRD_VERSION=0.78.2
 ARG NETBIRD_SOURCE_SHA256=e54b73c09653a533b719ec7e275d9af05f0ffaae548d697570bf6b5d71b13fc8
 ENV GOTOOLCHAIN=local
@@ -20,7 +20,10 @@ RUN go mod download github.com/pion/stun/v3@v3.1.5 github.com/pion/stun/v2@v2.0.
 RUN go mod download && go mod verify
 RUN CGO_ENABLED=0 go test -mod=readonly github.com/pion/stun/v2 github.com/pion/dtls/v2/pkg/crypto/ciphersuite -run TestHomeTunnel
 RUN CGO_ENABLED=0 python3 /tmp/collect_licenses.py /out/licenses
-RUN CGO_ENABLED=0 go build -mod=readonly -trimpath -tags load_wgnt_from_rsrc \
+# Run the compiler on the builder's CPU even when the final image targets arm64.
+ARG TARGETOS
+ARG TARGETARCH
+RUN CGO_ENABLED=0 GOOS="${TARGETOS}" GOARCH="${TARGETARCH}" go build -mod=readonly -trimpath -tags load_wgnt_from_rsrc \
     -ldflags "-s -w -X github.com/netbirdio/netbird/version.version=${NETBIRD_VERSION}-hometunnel.1 -X main.builtBy=HomeTunnel" \
     -o /out/netbird ./client
 
