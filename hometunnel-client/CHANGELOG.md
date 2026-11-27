@@ -1,5 +1,10 @@
 # Changelog
 
+## 2.1.4 — Homeview label compatibility
+
+- Check shared labels for network addresses during preview, confirmation and reuse of saved settings.
+- Stop repeating a rejected Homeview registration and let the owner correct and confirm the settings.
+
 ## 2.1.3 — Homeview privacy and arm64 build
 
 - Cross-compile NetBird for arm64 without emulating the compiler that crashed during the 2.1.2 build.

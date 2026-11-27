@@ -107,7 +107,12 @@ class Reporter:
         self.next_sequence = 1
         self.manifest_pending = None
         self.report_pending = None
+        self.manifest_rejected = False
         self.failures = 0
+
+    def invalidate_reporting(self):
+        self.registered = self.manifest_pending = self.report_pending = None
+        self.lease = 0
 
     def accept_config(self, config):
         if self.config and self.config["schemaVersion"] != config["schemaVersion"]:
@@ -137,7 +142,18 @@ class Reporter:
             self.manifest_pending = generation, body
         if not current():
             return False
-        answer = await portal.manifest(self.manifest_pending[1])
+        try:
+            answer = await portal.manifest(self.manifest_pending[1])
+        except RequestFailure as error:
+            if error.status != 400:
+                raise
+            if current():
+                self.manifest_rejected = True
+                self.invalidate_reporting()
+                self.status = "review_settings"
+            return False
+        if not current():
+            return False
         session = answer["session"]
         if (not answer["enabled"] or answer["consentGeneration"] != generation
                 or (selection.enabled and (not session or session["bootId"] != self.boot))
@@ -156,11 +172,8 @@ class Reporter:
         self.failures += 1
         delay = min(60, 2 ** min(self.failures, 6)) + self.jitter()
         if status in (401, 402, 403, 404, 406, 409):
-            self.lease = 0
+            self.invalidate_reporting()
             self.config = None
-            self.registered = None
-            self.manifest_pending = None
-            self.report_pending = None
             self.next_config = 0
             self.status = {401: "pairing_required", 402: "portal_off", 403: "portal_off", 404: "unsupported", 406: "unsupported", 409: "waiting_portal"}[status]
             if status in (401, 402, 403, 404, 406):
@@ -178,12 +191,24 @@ class Reporter:
     async def step(self, selection, identity, portal, collector, current, acknowledge_disable):
         key = (identity, selection.revision if selection else None) if identity else None
         if key != self.key:
-            self.key = key
             self.reset()
+            self.status = "waiting_portal" if selection and selection.enabled else "off"
+            self.key = key
         if not key:
             self.status = "off"
             return
-        if not current() or self.clock() < self.next_attempt:
+        if not current():
+            return
+        review = "review_settings" if self.manifest_rejected else None
+        if selection and selection.enabled:
+            try:
+                Settings.validate_labels(identity, selection.monitors)
+            except ValueError:
+                review = "review_labels"
+        if review:
+            self.invalidate_reporting()
+            self.status = review
+        if self.clock() < self.next_attempt:
             return
         try:
             if self.clock() >= self.next_config or self.config is None:
@@ -195,14 +220,13 @@ class Reporter:
                 self.status = "off"
                 self.failures = 0
                 return
-            if selection.enabled:
-                try:
-                    Settings.validate_labels(identity, selection.monitors)
-                except ValueError:
-                    self.status = "review_labels"
-                    self.report_pending = None
-                    self.next_attempt = self.clock() + POLICY["reportIntervalSeconds"]
-                    return
+            if review:
+                self.lease = 0
+                self.failures = 0
+                if not selection.enabled and not self.config["enabled"]:
+                    acknowledge_disable()
+                    self.status = "off"
+                return
             version = self.config["schemaVersion"]
             activation = self.config.get("activationGeneration")
             if (version == 2 and selection.enabled and not self.config["enabled"] and activation
@@ -277,7 +301,10 @@ class Reporter:
                 self.status = "reporting"
             self.failures = 0
         except RequestFailure as error:
-            self.handle_failure(error)
+            if current():
+                self.handle_failure(error)
+                if review:
+                    self.status = review
 
 
 class HomeviewRuntime:
@@ -313,9 +340,11 @@ class HomeviewRuntime:
         identity, selection, _ = self._selection(for_preview=True)
         status = "off"
         if selection and selection.enabled:
-            status = self.reporter.status
+            status = self.reporter.status if self.reporter.key == (identity, selection.revision) else "waiting_portal"
         elif selection and selection.disable_pending:
             status = "stopping"
+            if self.reporter.key == (identity, selection.revision) and self.reporter.manifest_rejected:
+                status = "review_settings"
         config = self.portal_config(identity)
         return {
             "protocol": config["schemaVersion"] if config else None,

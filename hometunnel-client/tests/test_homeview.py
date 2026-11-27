@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 import json
 from pathlib import Path
@@ -14,7 +15,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "rootfs/opt/hometun
 # same dependency stubs as the other add-on tests.
 import test_client_recovery_state  # noqa: F401
 
-from homeview import HomeviewRuntime, Portal, Reporter, parse_config
+from heartbeat_payload import build_heartbeat_payload
+from homeview import MAX_SEQUENCE, HomeviewRuntime, Portal, Reporter, parse_config
 from homeview_checks import Collector, RequestFailure, entity_observation, lan_boundary, observation, safe_route, safe_target, stamp, tcp_probe
 from homeview_config import Identity, Settings, parse_monitors, portal_origin
 
@@ -206,6 +208,7 @@ class FakePortal:
         self.value = {**fixture("config"), "session": None, "manifestRevision": 0}
         self.manifests = []
         self.reports = []
+        self.manifest_status = None
         self.lose_manifest_ack = False
         self.lose_report_ack = False
         self.last_manifest = self.last_report = None
@@ -215,6 +218,8 @@ class FakePortal:
 
     async def manifest(self, body):
         self.manifests.append(body)
+        if self.manifest_status is not None:
+            raise RequestFailure(self.manifest_status)
         args = json.loads(body)
         if body != self.last_manifest:
             if args["expectedRevision"] != self.value["manifestRevision"]:
@@ -295,6 +300,174 @@ class ReportingTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotEqual(self.reporter.boot, old.boot)
         self.assertEqual(json.loads(self.portal.reports[-1])["sequence"], 1)
         self.assertNotEqual(json.loads(self.portal.reports[-1])["sessionId"], json.loads(self.portal.reports[0])["sessionId"])
+
+    async def test_manifest_400_blocks_until_corrected_selection_is_confirmed(self):
+        with tempfile.TemporaryDirectory() as directory, self.assertNoLogs(level="WARNING"):
+            paired = pairing()
+            paired["route"] = {"current_endpoint": "http://192.0.2.41:80", "target_port": 80}
+            heartbeat = build_heartbeat_payload(paired["netbird"], paired)
+            runtime = HomeviewRuntime(Path(directory) / "homeview.json", lambda: paired)
+            runtime.reporter = self.reporter
+            rows = [{"kind": "ha_api", "label": "Synthetic core label"}]
+            preview = runtime.preview("admin", {"revision": runtime.view()["revision"], "monitors": rows})
+            runtime.confirm("admin", preview["preview"])
+            selection = runtime.settings.get(IDENTITY)
+            self.reporter.key = (IDENTITY, selection.revision)
+            self.reporter.accept_config(await self.portal.config())
+            self.reporter.registered = ("generation", 1, "stale-session")
+            self.reporter.next_sequence = MAX_SEQUENCE + 1
+            self.reporter.report_pending = (0, MAX_SEQUENCE, b"stale report")
+            self.portal.config = AsyncMock(wraps=self.portal.config)
+            self.portal.manifest_status = 400
+            self.collector.collect.side_effect = lambda monitors, _: [
+                observation(monitors[0], "responding", now=self.now())
+            ]
+
+            async def step():
+                await self.reporter.step(runtime.settings.get(IDENTITY), IDENTITY, self.portal,
+                                         self.collector, lambda: True, lambda: None)
+
+            for self.seconds in (0, 2, 6, 60, 120, 180):
+                await step()
+                self.assertEqual(runtime.view()["status"], "review_settings")
+                self.assertIsNone(self.reporter.manifest_pending)
+                self.assertIsNone(self.reporter.report_pending)
+                self.assertIsNone(self.reporter.registered)
+                self.assertEqual(self.reporter.lease, 0)
+            self.assertEqual(self.portal.config.await_count, 3)
+            self.assertEqual(len(self.portal.manifests), 1)
+            self.assertFalse(self.portal.reports)
+            self.collector.collect.assert_not_awaited()
+
+            rows[0]["label"] = "Ⓗome interface"
+            preview = runtime.preview("admin", {"revision": selection.revision, "monitors": rows})
+            self.portal.manifest_status = None
+            await step()
+            self.assertEqual(len(self.portal.manifests), 1)
+            runtime.confirm("admin", preview["preview"])
+            corrected = runtime.settings.get(IDENTITY)
+            self.assertNotEqual(corrected.revision, selection.revision)
+            self.assertEqual(corrected.monitors[0].id, selection.monitors[0].id)
+            await step()
+            self.assertEqual(runtime.view()["status"], "reporting")
+            self.assertEqual(len(self.portal.manifests), 2)
+            manifest = json.loads(self.portal.manifests[-1])
+            self.assertEqual(manifest["monitors"][0]["label"], "Ⓗome interface")
+            self.assertEqual(json.loads(self.portal.reports[0])["sequence"], 1)
+            self.collector.collect.assert_awaited_once()
+            self.assertEqual(build_heartbeat_payload(paired["netbird"], paired), heartbeat)
+
+    async def test_manifest_400_does_not_block_disable(self):
+        self.portal.manifest_status = 400
+        await self.step()
+        self.assertEqual(self.reporter.status, "review_settings")
+
+        self.portal.manifest_status = None
+        self.selection.revision = "disabled-revision"
+        self.selection.enabled = False
+        self.selection.disable_pending = True
+        acknowledge = Mock()
+        await self.reporter.step(self.selection, IDENTITY, self.portal, self.collector, lambda: True, acknowledge)
+        acknowledge.assert_called_once()
+        self.assertEqual(self.reporter.status, "off")
+        self.assertEqual(json.loads(self.portal.manifests[-1])["monitors"], [])
+        self.assertFalse(self.portal.reports)
+        self.collector.collect.assert_not_awaited()
+
+    async def test_repair_during_blocked_config_poll_clears_the_block(self):
+        self.portal.manifest_status = 400
+        await self.step()
+        self.assertEqual(self.reporter.status, "review_settings")
+        started, release = asyncio.Event(), asyncio.Event()
+        current = True
+        config = self.portal.config
+
+        async def poll():
+            started.set()
+            await release.wait()
+            return await config()
+
+        self.seconds = 60
+        self.portal.config = poll
+        task = asyncio.create_task(self.reporter.step(
+            self.selection, IDENTITY, self.portal, self.collector, lambda: current, lambda: None,
+        ))
+        await asyncio.wait_for(started.wait(), 1)
+        current = False
+        release.set()
+        await task
+        self.assertEqual(len(self.portal.manifests), 1)
+        self.assertEqual(self.reporter.lease, 0)
+        self.collector.collect.assert_not_awaited()
+
+        # The same selection revision under a different pairing has its own state.
+        other = replace(IDENTITY, home="other-home", binding="other-binding")
+        other_portal = FakePortal()
+        await self.reporter.step(self.selection, other, other_portal, self.collector, lambda: True, lambda: None)
+        self.assertEqual(self.reporter.status, "reporting")
+        self.assertEqual(len(other_portal.reports), 1)
+
+    async def test_stale_in_flight_manifest_400_cannot_block_replacement(self):
+        started, release = asyncio.Event(), asyncio.Event()
+        current = True
+
+        async def reject(_):
+            started.set()
+            await release.wait()
+            raise RequestFailure(400)
+
+        manifest = self.portal.manifest
+        self.portal.manifest = reject
+        task = asyncio.create_task(self.reporter.step(
+            self.selection, IDENTITY, self.portal, self.collector, lambda: current, lambda: None,
+        ))
+        await asyncio.wait_for(started.wait(), 1)
+        current = False
+        release.set()
+        await task
+        self.assertFalse(self.reporter.manifest_rejected)
+        self.collector.collect.assert_not_awaited()
+
+        self.portal.manifest = manifest
+        self.selection.revision = "confirmed-replacement"
+        await self.step()
+        self.assertEqual(self.reporter.status, "reporting")
+        self.assertEqual(len(self.portal.reports), 1)
+
+    async def test_manifest_transient_failures_and_conflict_remain_retryable(self):
+        for status, identical in ((429, True), (503, True), (409, False)):
+            with self.subTest(status=status):
+                self.setUp()
+                self.portal.manifest_status = status
+                await self.step()
+                self.assertEqual(self.reporter.status, "waiting_portal")
+                self.seconds = 1
+                await self.step()
+                self.assertEqual(len(self.portal.manifests), 1)
+                self.portal.manifest_status = None
+                self.seconds = 2
+                await self.step()
+                self.assertEqual(self.portal.manifests[0] == self.portal.manifests[1], identical)
+                self.assertEqual(len(self.portal.reports), 1)
+
+    async def test_config_and_report_400_keep_generic_retries(self):
+        config, report = self.portal.config, self.portal.report
+        self.portal.config = AsyncMock(side_effect=RequestFailure(400))
+        await self.step()
+        self.assertEqual(self.reporter.status, "waiting_portal")
+        self.portal.config = config
+        self.portal.report = AsyncMock(side_effect=RequestFailure(400))
+        self.seconds = 2
+        await self.step()
+        self.assertEqual(self.reporter.status, "waiting_portal")
+        pending = self.portal.report.call_args.args[0]
+        self.portal.report = report
+        self.seconds = 6
+        await self.step()
+        self.assertEqual(self.portal.reports, [pending])
+        self.assertEqual(self.reporter.next_sequence, 2)
+        self.assertEqual(len(self.portal.manifests), 1)
+        self.collector.collect.assert_awaited_once()
 
     async def test_expired_lease_or_revoked_config_prevents_further_probes_and_reports(self):
         await self.step()

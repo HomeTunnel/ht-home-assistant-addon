@@ -84,6 +84,20 @@ revision as its retry key. An older portal accepts V1-compatible checks
 when the separate HA API check is on. Contact, light and switch values
 and setups without the HA API check require V2.
 
+Both versions reject IP addresses, address-like hostnames, and network
+URLs in shared labels, including URLs with single-label hosts. Address
+checks use Unicode NFKC normalization and preserve approved display text.
+The add-on also screens for pasted credentials, entity IDs, and private
+local identifiers. If a saved label needs review, the add-on keeps the
+selection and stops Homeview reporting until the labels are corrected
+through **Review sharing** and confirmed. TCP targets and Home Assistant
+interface access keep their existing behavior.
+
+An HTTP 400 from manifest registration stops Homeview checks and retries
+for that local pairing and selection in the running collector. Review the
+shared labels and checks, then confirm any corrections to resume. Local
+disable still stops checks and may send a new empty manifest.
+
 A missing or replaced entity, a returned unknown state, an explicit
 unavailable state, and inability to reach Core produce distinct local
 diagnostics. The published portal can display a general Core message

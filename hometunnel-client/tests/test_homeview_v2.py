@@ -12,7 +12,7 @@ from test_homeview import FakePortal, IDENTITY, MONITORS, T, pairing, state
 from homeview import HomeviewRuntime, Reporter, parse_config
 from homeview_catalog import Catalog, CatalogError, is_core_admin
 from homeview_checks import Collector, RequestFailure, entity_observation, stamp
-from homeview_config import Settings, parse_monitors
+from homeview_config import Settings, contains_network_address, parse_monitors
 
 
 def fixture(name):
@@ -181,35 +181,119 @@ class CollectorTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(entity_observation(percent, state(percent.entity, "18.5", unit="V"))["reason"], "invalid_entity")
 
 
-class SettingsAndProtocolTests(unittest.IsolatedAsyncioTestCase):
-    async def test_addresses_are_blocked_at_preview_and_before_sending_saved_labels(self):
-        with tempfile.TemporaryDirectory() as directory:
-            runtime = HomeviewRuntime(Path(directory) / "homeview.json", pairing)
-            runtime.catalog = Catalog(AsyncMock(return_value=(DEVICES, REGISTRY, STATES)))
-            revision = runtime.view()["revision"]
-            item = (await runtime.discover("binary_sensor.front", 0))["items"][0]
-            monitor = {"key": item["key"], "kind": "entity_availability"}
-            for label in ("Garage camera 192.0.2.41", "Camera [2001:db8::41]:8123",
-                          "Camera fd00::", "Camera camera.local", "Camera １９２.０.２.４１"):
-                with self.subTest(label=label), self.assertRaisesRegex(ValueError, "address_in_label"):
-                    runtime.preview("admin", {"revision": revision, "monitors": [{**monitor, "label": label}]})
+# The portal's V1/V2 corpus, plus cross-runtime boundary cases.
+REJECTED_ADDRESS_LABELS = (
+    "Camera 192.168.1.50", "Router 10.0.0.1", "https://ha.example.test:8123",
+    "2001:db8::1234", "Home ha.local", "Door (http://router:8123)",
+    "Camera [fe80::1%en0]:8123", "IPv6 ::ffff:192.0.2.32", "Home ｈａ．ｌｏｃａｌ",
+    "//router:8123", "Door //router:8123", "ｈｔｔｐ：／／router:8123", "[fe80::abcd%eth0]",
+    "é192.0.2.41界", "界router.localé", "界//router:8123", "界[2001:db8::41]界", "Camera fd00::",
+)
+ACCEPTED_ADDRESS_LABELS = (
+    "Hall light (upstairs)", "Cámara: entrada 🚪", "Camera v1.2.3", "Version 2.3",
+    "Clock 12:34:56", "🚪" * 64, "Ⓗall light (upstairs)",
+    "界2001:db8::41界", "é::1", "word//router:8123", "Door //\ufeffrouter",
+)
 
-        portal = FakePortal()
-        portal.value = fixture("configBeforeActivation")
-        portal.activate = AsyncMock()
-        reporter = Reporter(lambda: 0, jitter=lambda: 0)
-        selection = type("Selection", (), {
-            "revision": "old", "enabled": True, "disable_pending": False,
-            "monitors": (replace(MONITORS[0], label="Camera 192.0.2.41"),),
-            "activation_generation": "pair-grant-1",
-        })()
-        collector = AsyncMock()
-        await reporter.step(selection, IDENTITY, portal, collector, lambda: True, lambda: None)
-        self.assertEqual(reporter.status, "review_labels")
-        portal.activate.assert_not_awaited()
-        self.assertEqual(portal.manifests, [])
-        self.assertEqual(portal.reports, [])
-        collector.collect_v2.assert_not_awaited()
+
+class SettingsAndProtocolTests(unittest.IsolatedAsyncioTestCase):
+    def test_v1_and_v2_match_portal_shared_label_corpus(self):
+        for v2 in (False, True):
+            for label in REJECTED_ADDRESS_LABELS + ACCEPTED_ADDRESS_LABELS:
+                with self.subTest(v2=v2, label=label):
+                    rejected = label in REJECTED_ADDRESS_LABELS
+                    self.assertEqual(contains_network_address(label), rejected)
+                    rows = [{"kind": "ha_api", "label": label}]
+                    if rejected:
+                        with self.assertRaisesRegex(ValueError, r"^(address_in_label|invalid_label)$"):
+                            Settings.validate_labels(IDENTITY, parse_monitors(rows, v2=v2))
+                    else:
+                        monitors = parse_monitors(rows, v2=v2)
+                        Settings.validate_labels(IDENTITY, monitors)
+                        self.assertEqual(monitors[0].manifest(2 if v2 else 1)["label"], label)
+            for label in ("", None, " Hall", "Hall ", "Hall\u0085light", "Hall\u202elight", "Hall\u2066light", "🚪" * 65):
+                with self.subTest(v2=v2, label=label), self.assertRaisesRegex(ValueError, "^invalid_label$"):
+                    parse_monitors([{"kind": "ha_api", "label": label}], v2=v2)
+
+    def test_addon_keeps_stricter_private_label_checks(self):
+        entity = parse_monitors([{**CONTACT, "entity": "binary_sensor._private"}], v2=True)[0]
+        for label in ("Door://", "Bearer synthetic", "abcdefghijklmnop.abcdefghijklmnop.", IDENTITY.token,
+                      entity.entity, entity.registry_id, entity.device_id, "canary-supervisor-token"):
+            with self.subTest(label=label), patch.dict("os.environ", SUPERVISOR_TOKEN="canary-supervisor-token"):
+                with self.assertRaisesRegex(ValueError, "^invalid_label$"):
+                    Settings.validate_labels(IDENTITY, (replace(entity, label=label),))
+        with self.assertRaisesRegex(ValueError, "^invalid_label$"):
+            parse_monitors([{"kind": "ha_api", "label": "http://router:8123"}])
+
+    async def test_preview_and_confirmation_reject_prohibited_labels_safely(self):
+        with tempfile.TemporaryDirectory() as directory, self.assertNoLogs(level="WARNING"):
+            runtime = HomeviewRuntime(Path(directory) / "homeview.json", pairing)
+            revision = runtime.view()["revision"]
+            label = "Door //router:8123"
+            body = {"revision": revision, "monitors": [{"kind": "ha_api", "label": label}]}
+            with self.assertRaisesRegex(ValueError, "^address_in_label$"):
+                runtime.preview("admin", body)
+            # Simulate a preview issued before the address check identified this form.
+            with patch("homeview_config.contains_network_address", return_value=False):
+                preview = runtime.preview("admin", body)
+            with self.assertRaisesRegex(ValueError, "^address_in_label$"):
+                runtime.confirm("admin", preview["preview"])
+            self.assertFalse(runtime.view()["enabled"])
+            self.assertEqual(runtime.view()["revision"], revision)
+
+    async def test_saved_prohibited_labels_preserve_selection_and_discard_pending_payloads(self):
+        for config, label in (
+            (FakePortal().value, "Door //router:8123"),
+            (fixture("configBeforeActivation"), "ｈｔｔｐ：／／router:8123"),
+            (fixture("configBeforeActivation"), "http://router:8123"),
+        ):
+            with self.subTest(version=config["schemaVersion"], label=label), tempfile.TemporaryDirectory() as directory:
+                file = Path(directory) / "homeview.json"
+                saved = {
+                    "scope": list(IDENTITY.scope), "revision": "old", "enabled": True, "disable_pending": False,
+                    "activation_generation": config.get("activationGeneration"),
+                    "monitors": [
+                        {"id": "ha", "kind": "ha_api", "label": label},
+                        {"id": "tcp", "kind": "tcp_service", "label": "Camera port", "ip": "192.168.5.20", "port": 8123},
+                    ],
+                }
+                file.write_text(json.dumps(saved))
+                runtime = HomeviewRuntime(file, pairing)
+                portal = FakePortal()
+                portal.value = config
+                portal.activate = AsyncMock()
+                now = [0]
+                reporter = runtime.reporter = Reporter(lambda: now[0], jitter=lambda: 0)
+                selection = runtime.settings.get(IDENTITY)
+                reporter.key = (IDENTITY, selection.revision)
+                reporter.manifest_pending = ("generation", b"stale manifest")
+                reporter.report_pending = (0, 1, b"stale report")
+                reporter.registered = ("generation", 1, "old-session")
+                reporter.lease = reporter.next_attempt = 10
+                collector = AsyncMock()
+                with self.assertNoLogs(level="WARNING"):
+                    for at in (0, 60, 120):
+                        now[0] = at
+                        await reporter.step(selection, IDENTITY, portal, collector, lambda: True, lambda: None)
+                        self.assertEqual(runtime.view()["status"], "review_labels")
+                        self.assertEqual(reporter.lease, 0)
+                        self.assertIsNone(reporter.registered)
+                        self.assertIsNone(reporter.manifest_pending)
+                        self.assertIsNone(reporter.report_pending)
+                portal.activate.assert_not_awaited()
+                self.assertEqual(portal.manifests, [])
+                self.assertEqual(portal.reports, [])
+                collector.collect.assert_not_awaited()
+                collector.collect_v2.assert_not_awaited()
+                self.assertEqual(json.loads(file.read_text()), saved)
+                rows = [{key: value for key, value in row.items() if key != "id"} for row in saved["monitors"]]
+                rows[0]["label"] = "Core"
+                preview = runtime.preview("admin", {"revision": selection.revision, "monitors": rows})
+                runtime.confirm("admin", preview["preview"])
+                corrected = runtime.settings.get(IDENTITY)
+                self.assertNotEqual(corrected.revision, selection.revision)
+                self.assertEqual([m.id for m in corrected.monitors], ["ha", "tcp"])
+                self.assertEqual(corrected.monitors[1].target, selection.monitors[1].target)
 
     async def test_exact_preview_does_not_select_siblings_and_binds_admin_and_pairing(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -276,7 +360,7 @@ class SettingsAndProtocolTests(unittest.IsolatedAsyncioTestCase):
             with self.assertRaisesRegex(ValueError, "no_checks"):
                 runtime.preview("admin", {"revision": "v1-save", "monitors": []})
 
-    async def test_v2_activation_retry_and_exact_manifest_report_payloads(self):
+    async def test_v2_activation_400_remains_retryable_with_exact_payloads(self):
         portal = FakePortal()
         portal.value = fixture("configBeforeActivation")
         accepted = fixture("config") | {"session": None, "manifestRevision": 0}
@@ -314,7 +398,7 @@ class SettingsAndProtocolTests(unittest.IsolatedAsyncioTestCase):
 
         async def activate(body):
             if clock[0] == 0:
-                raise RequestFailure()
+                raise RequestFailure(400)
             portal.value = accepted
             return await portal.config()
         portal.activate = AsyncMock(side_effect=activate)

@@ -15,6 +15,7 @@ from uuid import uuid4
 
 ID = re.compile(r"[A-Za-z0-9_-]{1,80}")
 ENTITY = re.compile(r"[a-z0-9_]{1,64}\.[a-z0-9_]{1,190}")
+PRIVATE_LABEL_SYNTAX = re.compile(r"://|(?i:\bbearer\s)|[A-Za-z0-9_-]{16,}\.[A-Za-z0-9_-]{16,}\.")
 KINDS = {"ha_api", "entity_availability", "entity_connectivity", "battery_percent", "battery_binary", "tcp_service"}
 V2_KINDS = {"entity_contact", "entity_light", "entity_switch"}
 CONTACT_CLASSES = {"door", "window", "opening", "garage_door"}
@@ -35,13 +36,20 @@ def is_id(value) -> bool:
 
 def contains_network_address(label):
     label = unicodedata.normalize("NFKC", label)
-    if re.search(r"\b(?:[0-9]{1,3}\.){3}[0-9]{1,3}\b", label):
+    # Match the portal's ASCII word boundaries and ECMAScript whitespace.
+    if re.search(r"\b(?:[0-9]{1,3}\.){3}[0-9]{1,3}\b", label, re.ASCII):
         return True
-    if re.search(r"\b(?:[a-z0-9-]+\.)+[a-z][a-z0-9-]*\b", label, re.IGNORECASE):
+    if re.search(r"\b(?:[a-z0-9-]+\.)+[a-z][a-z0-9-]*\b", label, re.ASCII | re.IGNORECASE):
         return True
-    for candidate in re.findall(r"[0-9a-f:.]*:[0-9a-f:.]+|[0-9a-f:.]*::", label, re.IGNORECASE):
+    if re.search(r"(?<![\w:/])(?:[a-z][a-z0-9+.-]*:)?//"
+                 r"[^\t-\r \u00a0\u1680\u2000-\u200a\u2028\u2029\u202f\u205f\u3000\ufeff/?#]",
+                 label, re.ASCII | re.IGNORECASE):
+        return True
+    # The IPv6 matcher uses Unicode letters and numbers (plus underscore)
+    # at its boundaries and ASCII hex digits in the candidate itself.
+    for candidate in re.finditer(r"(?<![\w:])(?ai:[a-f0-9.]*:[a-f0-9:.]*:[a-f0-9:.]*)(?![\w:])", label):
         try:
-            ipaddress.IPv6Address(candidate.rstrip("."))
+            ipaddress.IPv6Address(candidate[0].strip("."))
         except ValueError:
             continue
         return True
@@ -171,8 +179,8 @@ def parse_monitors(value, previous=(), *, stored=False, v2=False):
         if (not isinstance(label, str) or not 1 <= len(label) <= 64 or label.strip() != label
                 or any(unicodedata.category(c) == "Cc" or "\u202a" <= c <= "\u202e" or "\u2066" <= c <= "\u2069" for c in label)):
             raise ValueError("invalid_label")
-        # Labels are the only free text transmitted. Catch common pasted secrets/URLs.
-        if re.search(r"://|(?i:\bbearer\s)|[A-Za-z0-9_-]{16,}\.[A-Za-z0-9_-]{16,}\.", label):
+        # Keep stored text available for owner review if it fails privacy checks.
+        if not stored and PRIVATE_LABEL_SYNTAX.search(label):
             raise ValueError("invalid_label")
         label.encode("utf-8", errors="strict")
         entity = ip = port = low = registry = device = group = device_group = None
@@ -320,8 +328,9 @@ class Settings:
         supervisor_token = os.environ.get("SUPERVISOR_TOKEN")
         if supervisor_token:
             private.add(supervisor_token)
-        if any(secret in m.label for secret in private for m in monitors):
-            raise ValueError("invalid_label")
+        for monitor in monitors:
+            if PRIVATE_LABEL_SYNTAX.search(monitor.label) or any(secret in monitor.label for secret in private):
+                raise ValueError("invalid_label")
         if any(contains_network_address(m.label) for m in monitors):
             raise ValueError("address_in_label")
 

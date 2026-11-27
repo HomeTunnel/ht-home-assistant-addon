@@ -31,7 +31,8 @@ document.addEventListener("DOMContentLoaded", () => {
     v2_required: "These checks require a Homeview V2 portal.",
     pairing_required: "Check this add-on’s pairing in HomeTunnel.",
     clock_error: "Check the Home Assistant system clock.",
-    review_labels: "Review your shared labels to resume reporting. Remove any addresses or private identifiers.",
+    review_labels: "Remove addresses or private identifiers from shared labels, then review and confirm sharing.",
+    review_settings: "HomeTunnel rejected these monitoring settings. Review your shared labels and checks, then confirm any corrections.",
   };
   const errors = {
     permission_denied: "Homeview requires an administrator signed in through Home Assistant.",
@@ -42,7 +43,7 @@ document.addEventListener("DOMContentLoaded", () => {
     v2_required: "The portal must support Homeview V2 to save these checks.",
     no_checks: "Choose at least one entity, TCP service, or Home Assistant API check.",
     invalid_settings: "Review the check labels, entity selections, and TCP addresses or ports.",
-    address_in_label: "Remove IP addresses or hostnames from shared labels.",
+    address_in_label: "Remove IP addresses, hostnames or network URLs from shared labels.",
   };
   let selected;
   let preview;

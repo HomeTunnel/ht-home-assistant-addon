@@ -46,6 +46,10 @@ availability and one typed signal. A typed-only group is permitted for
 migration and individual status selections. IDs are randomly generated
 locally. Never send HA IDs, addresses, friendly names without owner preview,
 registry attributes or arbitrary state strings.
+The server rejects labels containing IP addresses, network URLs or
+address-like hostnames (including `.local`) with `invalid_payload`. It checks
+address forms after Unicode NFKC normalization and preserves accepted label
+text. This semantic rule applies in addition to the JSON Schema.
 
 Each report contains one observation per selected monitor, with the source
 and result constrained by its kind. Entity availability is independent of
