@@ -22,6 +22,7 @@ from safe_logging import EventFormatter
 from homeview import HomeviewRuntime
 from homeview_catalog import CatalogError, MAX_ENTRIES, core_lists
 from homeview_checks import RequestFailure, request_json
+from homeview_config import parse_monitors
 
 
 
@@ -133,6 +134,75 @@ class RuntimeSecurityTests(unittest.IsolatedAsyncioTestCase):
                     self.assertEqual(fresh.status_code, 200)
                     confirmed = await client.post(path, json={"preview": fresh.json()["preview"]})
                     self.assertTrue(confirmed.json()["enabled"])
+
+    async def test_homeview_ingress_checks_resolved_limits_on_review_and_save(self):
+        from test_homeview import pairing
+
+        with tempfile.TemporaryDirectory() as directory:
+            runtime = HomeviewRuntime(pathlib.Path(directory) / "homeview.json", pairing)
+            devices = [{"id": f"device-{i}", "name": "Identical device name"} for i in range(6)]
+            entities = [{"id": f"entity-{i}", "device_id": f"device-{i % 6}", "entity_id": f"sensor.item_{i}"}
+                        for i in range(7)]
+            states = [{"entity_id": row["entity_id"], "state": "85",
+                       "attributes": {"device_class": "battery", "unit_of_measurement": "%"}} for row in entities]
+            runtime.catalog.fetch = AsyncMock(return_value=(devices, entities, states))
+            ingress = httpx.ASGITransport(app=app.app, client=("172.30.32.2", 4567))
+            headers = {"X-Homeview-UI": "1", "X-Remote-User-Id": "a" * 32}
+            path = "/api/homeview/local"
+            with patch.object(app, "homeview", runtime), patch.object(app, "is_core_admin", new=AsyncMock(return_value=True)):
+                async with httpx.AsyncClient(transport=ingress, base_url="http://addon", headers=headers) as client:
+                    initial = (await client.get(path)).json()
+                    self.assertEqual((initial["maxDevices"], initial["maxTcpServices"], initial["maxMonitors"]), (5, 3, 50))
+                    page = (await client.get(path + "/discovery")).json()
+                    keys = {item["hint"]: item["key"] for item in page["items"]}
+
+                    def entity(index, kind="entity_availability"):
+                        return {"key": keys[f"sensor.item_{index}"], "kind": kind}
+
+                    tcp = [{"kind": "tcp_service", "label": f"Local service {i}", "ip": "192.168.1.50", "port": 8000 + i}
+                           for i in range(4)]
+                    ha = {"kind": "ha_api", "label": "Core"}
+
+                    async def review(rows, revision=initial["revision"]):
+                        return await client.post(path + "/preview", json={"revision": revision, "monitors": rows})
+
+                    five = [entity(i) for i in range(5)]
+                    for rows, error in ((five + [entity(5)], "device_limit"), (tcp, "tcp_limit"),
+                                        ([{**tcp[0], "ip": "203.0.113.1"}], "invalid_settings")):
+                        denied = await review([ha, *rows])
+                        self.assertEqual((denied.status_code, denied.json()["error"]), (400, error))
+
+                    # Availability and a value share a slot. Two entities on the same device do too.
+                    at_capacity = [ha, *five, entity(6), entity(0, "battery_percent"), *tcp[:3]]
+                    allowed = await review(at_capacity)
+                    self.assertEqual(allowed.status_code, 200, allowed.text)
+                    self.assertNotIn("sensor.item_", allowed.text)
+
+                    # Simulate a pending confirmation resolved before the quota check was added.
+                    token = allowed.json()["preview"]
+                    pending = runtime.previews[token]
+                    extra = parse_monitors([{"kind": "entity_availability", "label": "Extra sensor",
+                                             "entity": "sensor.item_5", "registryId": "entity-5", "deviceId": "device-5"}],
+                                           v2=True)
+                    for additions, error in ((extra, "device_limit"), (parse_monitors(tcp[3:], v2=True), "tcp_limit")):
+                        runtime.previews[token] = (*pending[:4], pending[4] + additions, pending[5])
+                        denied = await client.post(path, json={"preview": token})
+                        self.assertEqual((denied.status_code, denied.json()["error"]), (400, error))
+                        self.assertFalse(runtime.view()["enabled"])
+
+                    allowed = await review(at_capacity)
+                    saved = (await client.post(path, json={"preview": allowed.json()["preview"]})).json()
+                    device_rows = [m for m in saved["monitors"] if "selector" in m]
+                    self.assertEqual(len({m["deviceSlot"] for m in device_rows}), 5)
+                    self.assertEqual({m["hint"] for m in device_rows}, {f"sensor.item_{i}" for i in (0, 1, 2, 3, 4, 6)})
+                    retained = [{"saved": m["id"], "kind": m["kind"], "label": m["label"]} for m in device_rows
+                                if m["selector"] != keys["sensor.item_4"]]
+                    for draft, status in (([ha, *retained, entity(4), entity(5)], 400),
+                                          ([ha, *retained, entity(5)], 200)):
+                        result = await review(draft, saved["revision"])
+                        self.assertEqual(result.status_code, status, result.text)
+                    updated = (await client.post(path, json={"preview": result.json()["preview"]})).json()
+                    self.assertTrue({m["saved"] for m in retained} <= {m["id"] for m in updated["monitors"]})
 
     async def test_homeview_uses_core_admin_and_rejects_spoofed_identity(self):
         path = "/api/homeview/local"
@@ -291,7 +361,7 @@ class RuntimeSecurityTests(unittest.IsolatedAsyncioTestCase):
             initial = runtime.settings.get(identity, for_preview=True)
             runtime.reporter.key = (identity, initial.revision)
             runtime.reporter.accept_config(inactive)
-            review = runtime.preview("admin", {"revision": initial.revision, "monitors": [
+            review = await runtime.preview("admin", {"revision": initial.revision, "monitors": [
                 {"kind": "tcp_service", "label": "Camera", "ip": "192.168.1.40", "port": 554}
             ]})
             runtime.confirm("admin", review["preview"])

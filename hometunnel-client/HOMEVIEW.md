@@ -6,27 +6,47 @@ If the portal owner authorized activation during pairing, confirming the
 local sharing preview activates monitoring. Other homes need approval in
 the portal. A portal pause or deletion takes precedence over local consent.
 
-- **Devices and entities** lists available, enabled entities from paired
+- **Devices and entities — up to 5 devices** lists available, enabled entities from paired
   devices. Search by device or entity name, then select each entity you want
-  to monitor. Each new selection includes availability. You can also share
+  to monitor. The form counts distinct Home Assistant device identities. A
+  contact and battery on the same device use one slot, and availability and
+  a value on the same entity also use that slot. At five devices you can still
+  browse the catalog and add entities from selected devices. Each new
+  selection starts with availability checked. You can also share
   an explicitly supported value, such as a closed contact, an off light
   or switch, or a low battery reading. Existing selections remain editable
   when they become unavailable.
-- **Home Assistant API** sets a separate reachability check. Existing
+- **Home Assistant API** sets a separate reachability check outside the device
+  and TCP limits. Existing
   installations keep their setting. Turning it off still lets selected
   entities report their own observations.
-- **Local TCP services** accepts an explicit private IPv4 address and port.
-  The check shows whether the port accepted a connection.
+- **Local TCP services — up to 3 services** accepts an explicit private IPv4
+  address and port for each service. The check shows whether the port accepted
+  a connection. The portal's 50-check policy still applies to the full selection.
 
-Review the shared labels, kinds, and battery thresholds before enabling or
-changing monitoring. The preview expires after two minutes and is scoped to
-the administrator, pairing, and saved selection revision. Stop sharing
+New entity checks suggest the Home Assistant device name as the shared label.
+Select **Customize shared label** to edit it. Clearing that checkbox restores
+the suggestion. If the name is missing, exceeds 64 characters, or fails the
+privacy checks, enter a valid custom label on the highlighted row. **Review
+sharing** shows the approved label candidates, check kinds, and battery
+thresholds home owners will see. Saved labels stay in use after an HA rename.
+To use the current device name for a saved picker selection, find that entity
+again, clear **Customize shared label**, then review and confirm.
+
+The confirmation expires after two minutes and is scoped to the
+administrator, pairing, and saved selection revision. Select **Review sharing**
+again if it expires. Stop sharing
 locally to halt the checks and queue a disabled manifest. If Core is down
 and local administrator authority cannot be confirmed, pause from the portal.
 
 Discovery uses fixed read-only Supervisor WebSocket calls. The picker
 allows up to 8 MiB per response and 12,000 rows per list, caches the filtered
-inventory for 60 seconds, and shows 40 results per page. Exceeding a limit
+inventory for 60 seconds, and shows 40 results per page. Review refreshes an
+expired inventory once and looks up all selected picker keys, including
+entities on other pages. If Core is temporarily unavailable, retry review in
+place. A missing entity, a move to another device, or a change in supported
+checks flags the affected row. Correct the row and review the same draft.
+Exceeding a discovery limit
 produces an explicit error. The 64 KiB report limit applies independently.
 Only the local administrator sees the discovery results. The portal
 receives approved labels, random monitor/group IDs, normalized observations
@@ -39,6 +59,12 @@ identity requires a new selection. Upgraded V1 selections retain their
 previous labels, IDs, targets and sharing scope. V1 never stored registry
 identity, so replace a legacy entity selection with an explicit picker
 selection to opt in to registry-based rename and replacement handling.
+Until then, each distinct legacy local entity counts as one device, even
+if several legacy entities belong to the same physical device. If an
+upgrade leaves a selection over either limit, the add-on pauses local
+sampling and reporting while retaining the saved checks and their IDs.
+**Stop sharing** remains available. Remove enough checks to meet both
+limits, then review and confirm to resume monitoring.
 
 ## Compatibility
 
@@ -116,12 +142,25 @@ negotiation, grant retries, TCP-only reporting, and reporting with NetBird
 disconnected. The fixture copies support offline validation with a Draft
 2020-12 JSON Schema validator.
 
+The Chromium test drives the real settings page and ingress routes with
+synthetic Core data. With the Python environment active, run:
+
+```sh
+browser_tools=$(mktemp -d)
+npm install --prefix "$browser_tools" playwright@1.62.1
+"$browser_tools/node_modules/.bin/playwright" install chromium
+PYTHON="$(command -v python)" NODE_PATH="$browser_tools/node_modules" node --test tests/homeview_picker.cjs
+```
+
 ## Live HAOS matrix
 
 | Scenario | Expected observation |
 | --- | --- |
 | Core 2024.4 floor and current stable Core on HAOS aarch64 and amd64 | Administrator ingress loads, non-admin ingress is denied, Core proxy returns registry and selected states |
 | Home with duplicate device names and a large registry | Available entities are distinguishable, search and paging work, and capped discovery displays an error |
+| Five devices and three TCP services | Counts update as checks change, additional entities on a selected device remain available, and removing a device or service frees its slot |
+| Expired picker inventory and confirmation | Off-page selections, label edits, thresholds, TCP entries, and HA API choices survive review, Core recovery, and a new confirmation |
+| Upgrade with over-limit settings | Checks and labels remain editable, sampling and reporting pause, Stop sharing works, and a compliant confirmation resumes monitoring |
 | Contact, light and switch | Closed and Off remain valid current values and only selected signals appear in Overview |
 | Rename and replacement at the same entity address | Rename follows the same registry ID, replacement requires fresh approval |
 | HA API toggle off with entity monitoring | No standalone reachability probe, entity reads supply optional Core evidence |

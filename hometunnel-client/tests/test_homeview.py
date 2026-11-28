@@ -309,7 +309,7 @@ class ReportingTests(unittest.IsolatedAsyncioTestCase):
             runtime = HomeviewRuntime(Path(directory) / "homeview.json", lambda: paired)
             runtime.reporter = self.reporter
             rows = [{"kind": "ha_api", "label": "Synthetic core label"}]
-            preview = runtime.preview("admin", {"revision": runtime.view()["revision"], "monitors": rows})
+            preview = await runtime.preview("admin", {"revision": runtime.view()["revision"], "monitors": rows})
             runtime.confirm("admin", preview["preview"])
             selection = runtime.settings.get(IDENTITY)
             self.reporter.key = (IDENTITY, selection.revision)
@@ -340,7 +340,7 @@ class ReportingTests(unittest.IsolatedAsyncioTestCase):
             self.collector.collect.assert_not_awaited()
 
             rows[0]["label"] = "Ⓗome interface"
-            preview = runtime.preview("admin", {"revision": selection.revision, "monitors": rows})
+            preview = await runtime.preview("admin", {"revision": selection.revision, "monitors": rows})
             self.portal.manifest_status = None
             await step()
             self.assertEqual(len(self.portal.manifests), 1)

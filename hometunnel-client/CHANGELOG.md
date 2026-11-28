@@ -1,5 +1,12 @@
 # Changelog
 
+## 2.1.5 — Homeview monitoring selections
+
+- Show and enforce up to five Home Assistant devices and three local TCP services. Checks from the same device use one device slot.
+- Suggest the Home Assistant device name as the shared label, with a custom label option and privacy validation during review.
+- Keep draft selections through discovery refreshes, temporary Core outages, and expired confirmations.
+- Preserve over-limit selections on upgrade and pause monitoring until a compliant selection is reviewed and confirmed.
+
 ## 2.1.4 — Homeview label compatibility
 
 - Check shared labels for network addresses during preview, confirmation and reuse of saved settings.

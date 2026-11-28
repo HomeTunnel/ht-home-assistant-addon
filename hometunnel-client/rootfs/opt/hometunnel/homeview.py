@@ -11,10 +11,20 @@ import httpx
 
 from homeview_catalog import Catalog
 from homeview_checks import Collector, RequestFailure, parse_time, request_json, stamp
-from homeview_config import Identity, KINDS, POLICY, Settings, is_id, new_id, parse_monitors
+from homeview_config import (
+    Identity, KINDS, MAX_DEVICES, MAX_TCP_SERVICES, POLICY, Settings,
+    exceeded_limit, is_id, monitor_usage, new_id, parse_monitors,
+)
 
 MAX_REVISION = 2147483647
 MAX_SEQUENCE = 9007199254740990
+PREVIEW_TTL = 120
+
+
+class ReviewError(ValueError):
+    def __init__(self, rows):
+        super().__init__(next(iter(rows.values())))
+        self.rows = rows
 
 
 def integer(value, low, high):
@@ -205,6 +215,8 @@ class Reporter:
                 Settings.validate_labels(identity, selection.monitors)
             except ValueError:
                 review = "review_labels"
+            if exceeded_limit(monitor_usage(selection.monitors)):
+                review = "over_limit"
         if review:
             self.invalidate_reporting()
             self.status = review
@@ -309,7 +321,7 @@ class Reporter:
 
 class HomeviewRuntime:
     """One cancellable worker in the ingress process; independent of tunnel status."""
-    def __init__(self, path, read_state):
+    def __init__(self, path, read_state, clock=time.monotonic):
         self.settings = Settings(path)
         self.read_state = read_state
         self.thread = None
@@ -321,7 +333,8 @@ class HomeviewRuntime:
         self.epoch = 0
         self.blocked_scope = None
         self.reporter = Reporter()
-        self.catalog = Catalog()
+        self.clock = clock
+        self.catalog = Catalog(clock=clock)
         self.previews = {}
 
     def identity(self):
@@ -341,6 +354,8 @@ class HomeviewRuntime:
         status = "off"
         if selection and selection.enabled:
             status = self.reporter.status if self.reporter.key == (identity, selection.revision) else "waiting_portal"
+            if exceeded_limit(monitor_usage(selection.monitors)):
+                status = "over_limit"
         elif selection and selection.disable_pending:
             status = "stopping"
             if self.reporter.key == (identity, selection.revision) and self.reporter.manifest_rejected:
@@ -350,11 +365,16 @@ class HomeviewRuntime:
             "protocol": config["schemaVersion"] if config else None,
             "activationAvailable": bool(config and config.get("activationGeneration")),
             "maxMonitors": POLICY["maxMonitors"],
+            "maxDevices": MAX_DEVICES,
+            "maxTcpServices": MAX_TCP_SERVICES,
             "paired": identity is not None, "enabled": bool(selection and selection.enabled),
             "revision": selection.revision if selection else None,
             "status": status,
             "monitors": [
-                {**m.browser(), **({"selector": self.catalog.handle(identity.scope, m.registry_id)} if m.registry_id else {})}
+                {**m.browser(),
+                 **({"selector": self.catalog.selector(identity.scope, m.registry_id, m.device_id)} if m.registry_id else {}),
+                 **({"deviceSlot": self.catalog.handle(identity.scope, *m.device_slot),
+                     "legacyDevice": m.registry_id is None} if m.device_slot else {})}
                 for m in selection.monitors
             ] if selection else [{"kind": "ha_api", "label": "Home Assistant"}],
         }
@@ -373,7 +393,7 @@ class HomeviewRuntime:
             raise ValueError("selection_changed")
         return result
 
-    def preview(self, user, body):
+    async def preview(self, user, body):
         identity, current, epoch = self._selection(for_preview=True)
         if not identity or not current or body.get("revision") != current.revision:
             raise ValueError("selection_changed")
@@ -383,54 +403,78 @@ class HomeviewRuntime:
             raise ValueError("no_checks")
         if len(body["monitors"]) > POLICY["maxMonitors"]:
             raise ValueError("invalid_settings")
-        rows = []
-        saved = {m.id: m for m in current.monitors}
-        for row in body["monitors"]:
+        draft = body["monitors"]
+        for row in draft:
             if not isinstance(row, dict) or not isinstance(row.get("kind"), str):
                 raise ValueError("invalid_settings")
+            if row["kind"] in ("ha_api", "tcp_service"):
+                continue
+            if set(row) - {"kind", "label", "key", "saved", "lowThreshold"} or ("key" in row) == ("saved" in row):
+                raise ValueError("invalid_settings")
+            if not is_id(row.get("key", row.get("saved"))):
+                raise ValueError("invalid_settings")
+        inventory = {}
+        if any("key" in row and row["kind"] not in ("ha_api", "tcp_service") for row in draft):
+            inventory = await self.catalog.inventory(identity.scope)
+            if epoch != self.epoch or self.identity() != identity:
+                raise ValueError("selection_changed")
+
+        saved = {m.id: m for m in current.monitors}
+        rows = []
+        row_errors = {}
+        defaults = set()
+        for index, row in enumerate(draft):
             kind = row["kind"]
             if kind in ("ha_api", "tcp_service"):
                 rows.append(row)
                 continue
-            if set(row) - {"kind", "label", "key", "saved", "lowThreshold"} or ("key" in row) == ("saved" in row):
-                raise ValueError("invalid_settings")
+            label = row.get("label")
             if "key" in row:
-                if not is_id(row["key"]):
-                    raise ValueError("invalid_settings")
-                candidate = self.catalog.lookup(identity.scope, row["key"])
+                candidate = inventory.get(row["key"])
                 if not candidate:
-                    raise ValueError("inventory_expired")
+                    row_errors[index] = "entity_changed"
+                    continue
                 if kind not in ("entity_availability", candidate.kind):
-                    raise ValueError("invalid_settings")
+                    row_errors[index] = "check_changed"
+                    continue
                 entity, registry, device = candidate.entity, candidate.registry, candidate.device
+                if "label" not in row:
+                    label = candidate.suggested_label
+                    defaults.add(index)
             else:
-                prior = saved.get(row["saved"]) if is_id(row["saved"]) else None
+                prior = saved.get(row["saved"])
                 if not prior or not prior.entity or prior.kind != kind:
                     raise ValueError("invalid_settings")
                 entity, registry, device = prior.entity, prior.registry_id, prior.device_id
-            fields = {"kind": kind, "label": row.get("label"), "entity": entity}
+            fields = {"kind": kind, "label": label, "entity": entity}
             if registry:
                 fields.update(registryId=registry, deviceId=device)
             if "lowThreshold" in row:
                 fields["lowThreshold"] = row["lowThreshold"]
             rows.append(fields)
+        if row_errors:
+            raise ReviewError(row_errors)
+        row_errors = self.settings.label_errors(identity, rows)
+        if row_errors:
+            raise ReviewError({index: "custom_label_required" if index in defaults else code
+                               for index, code in row_errors.items()})
         monitors = parse_monitors(rows, current.monitors, v2=True)
-        self.settings.validate_labels(identity, monitors)
+        limit = exceeded_limit(monitor_usage(monitors))
+        if limit:
+            raise ValueError(limit)
         config = self.portal_config(identity)
         v1_compatible = any(m.kind == "ha_api" for m in monitors) and all(m.kind in KINDS for m in monitors)
         if not v1_compatible and (not config or config["schemaVersion"] != 2):
             raise ValueError("v2_required")
-        deadline = time.monotonic() + 120
         token = new_id()
         activation = config.get("activationGeneration") if config else None
         with self.lock:
             if epoch != self.epoch or self.identity() != identity:
                 raise ValueError("selection_changed")
             # Keep a bounded number of short-lived previews across browser tabs.
-            self.previews = {key: preview for key, preview in self.previews.items() if preview[0] > time.monotonic()}
             if len(self.previews) >= 8:
                 self.previews.pop(next(iter(self.previews)))
-            self.previews[token] = (deadline, user, identity, current.revision, monitors, activation)
+            self.previews[token] = (self.clock() + PREVIEW_TTL, user, identity, current.revision, monitors, activation)
         return {"preview": token, "monitors": [
             {key: value for key, value in m.manifest().items() if key != "id"} for m in monitors
         ]}
@@ -439,10 +483,13 @@ class HomeviewRuntime:
         with self.lock:
             identity = self.identity()
             pending = self.previews.pop(token, None)
-            if (not pending or pending[0] <= time.monotonic() or pending[1] != user or pending[2] != identity
+            if (not identity or not pending or pending[1] != user or pending[2] != identity
                     or identity.scope == self.blocked_scope):
                 raise ValueError("selection_changed")
-            _, _, _, revision, monitors, activation = pending
+            deadline, _, _, revision, monitors, activation = pending
+            if deadline <= self.clock():
+                current = self.settings.get(identity)
+                raise ValueError("confirmation_expired" if current and current.revision == revision else "selection_changed")
             self.settings.commit(identity, revision, monitors, activation)
             self.epoch += 1
             self.previews.clear()

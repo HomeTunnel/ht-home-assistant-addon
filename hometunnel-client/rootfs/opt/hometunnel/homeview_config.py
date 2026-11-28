@@ -15,6 +15,8 @@ from uuid import uuid4
 
 ID = re.compile(r"[A-Za-z0-9_-]{1,80}")
 ENTITY = re.compile(r"[a-z0-9_]{1,64}\.[a-z0-9_]{1,190}")
+ECMASCRIPT_WHITESPACE_CLASS = r"\t-\r \u00a0\u1680\u2000-\u200a\u2028\u2029\u202f\u205f\u3000\ufeff"
+LABEL_EDGE_WHITESPACE = re.compile(rf"^[{ECMASCRIPT_WHITESPACE_CLASS}]|[{ECMASCRIPT_WHITESPACE_CLASS}]\Z")
 PRIVATE_LABEL_SYNTAX = re.compile(r"://|(?i:\bbearer\s)|[A-Za-z0-9_-]{16,}\.[A-Za-z0-9_-]{16,}\.")
 KINDS = {"ha_api", "entity_availability", "entity_connectivity", "battery_percent", "battery_binary", "tcp_service"}
 V2_KINDS = {"entity_contact", "entity_light", "entity_switch"}
@@ -24,6 +26,8 @@ POLICY = {
     "leaseSeconds": 180, "reportIntervalSeconds": 60, "staleAfterSeconds": 180,
     "maxMonitors": 50, "maxBodyBytes": 65536, "maxObservationAgeSeconds": 120, "maxFutureSkewSeconds": 30,
 }
+MAX_DEVICES = 5
+MAX_TCP_SERVICES = 3
 
 
 def new_id() -> str:
@@ -42,7 +46,7 @@ def contains_network_address(label):
     if re.search(r"\b(?:[a-z0-9-]+\.)+[a-z][a-z0-9-]*\b", label, re.ASCII | re.IGNORECASE):
         return True
     if re.search(r"(?<![\w:/])(?:[a-z][a-z0-9+.-]*:)?//"
-                 r"[^\t-\r \u00a0\u1680\u2000-\u200a\u2028\u2029\u202f\u205f\u3000\ufeff/?#]",
+                 rf"[^{ECMASCRIPT_WHITESPACE_CLASS}/?#]",
                  label, re.ASCII | re.IGNORECASE):
         return True
     # The IPv6 matcher uses Unicode letters and numbers (plus underscore)
@@ -132,6 +136,11 @@ class Monitor:
     def target(self):
         return (self.kind, self.registry_id or self.entity, self.ip, self.port)
 
+    @property
+    def device_slot(self):
+        if self.entity is not None:
+            return ("device", self.device_id) if self.registry_id and self.device_id else ("legacy", self.entity)
+
     def manifest(self, version=1):
         fields = {"id": self.id, "kind": self.kind, "label": self.label}
         if self.low_threshold is not None:
@@ -146,6 +155,8 @@ class Monitor:
         fields = self.manifest()
         if self.entity_group:
             fields["entityGroupId"] = self.entity_group
+        if self.entity is not None:
+            fields["hint"] = self.entity
         if self.ip is not None:
             fields.update(ip=self.ip, port=self.port)
         return fields
@@ -159,6 +170,32 @@ class Monitor:
         if self.ip is not None:
             fields.update(ip=self.ip, port=self.port)
         return fields
+
+
+def monitor_usage(monitors):
+    slots = {monitor.device_slot for monitor in monitors if monitor.device_slot}
+    return {
+        "devices": len(slots),
+        "tcpServices": sum(monitor.kind == "tcp_service" for monitor in monitors),
+    }
+
+
+def exceeded_limit(usage):
+    if usage["devices"] > MAX_DEVICES:
+        return "device_limit"
+    if usage["tcpServices"] > MAX_TCP_SERVICES:
+        return "tcp_limit"
+
+
+def valid_label_syntax(label, *, stored=False):
+    if (not isinstance(label, str) or not 1 <= len(label) <= 64
+            or any(unicodedata.category(c) in ("Cc", "Cs") or "\u202a" <= c <= "\u202e"
+                   or "\u2066" <= c <= "\u2069" for c in label)):
+        return False
+    if stored:
+        # Keep the earlier file format readable so owners can correct rejected labels.
+        return label.strip() == label
+    return not (LABEL_EDGE_WHITESPACE.search(label) or PRIVATE_LABEL_SYNTAX.search(label))
 
 
 def parse_monitors(value, previous=(), *, stored=False, v2=False):
@@ -176,13 +213,8 @@ def parse_monitors(value, previous=(), *, stored=False, v2=False):
         kind, label = fields.pop("kind", None), fields.pop("label", None)
         if not isinstance(kind, str) or kind not in (KINDS | V2_KINDS if v2 else KINDS):
             raise ValueError("invalid_kind")
-        if (not isinstance(label, str) or not 1 <= len(label) <= 64 or label.strip() != label
-                or any(unicodedata.category(c) == "Cc" or "\u202a" <= c <= "\u202e" or "\u2066" <= c <= "\u2069" for c in label)):
+        if not valid_label_syntax(label, stored=stored):
             raise ValueError("invalid_label")
-        # Keep stored text available for owner review if it fails privacy checks.
-        if not stored and PRIVATE_LABEL_SYNTAX.search(label):
-            raise ValueError("invalid_label")
-        label.encode("utf-8", errors="strict")
         entity = ip = port = low = registry = device = group = device_group = None
         if kind == "tcp_service":
             ip, port = fields.pop("ip", None), fields.pop("port", None)
@@ -322,19 +354,35 @@ class Settings:
             return self._commit(current, monitors, None)
 
     @staticmethod
-    def validate_labels(identity, monitors):
-        private = {identity.token, *(m.entity for m in monitors if m.entity), *(m.ip for m in monitors if m.ip),
-                   *(m.registry_id for m in monitors if m.registry_id), *(m.device_id for m in monitors if m.device_id)}
+    def label_errors(identity, rows):
+        private = {identity.token}
+        for row in rows:
+            for key in ("entity", "ip", "registryId", "deviceId"):
+                value = row.get(key)
+                if isinstance(value, str) and value:
+                    private.add(value)
         supervisor_token = os.environ.get("SUPERVISOR_TOKEN")
         if supervisor_token:
             private.add(supervisor_token)
-        for monitor in monitors:
-            if PRIVATE_LABEL_SYNTAX.search(monitor.label) or any(secret in monitor.label for secret in private):
-                raise ValueError("invalid_label")
-        if any(contains_network_address(m.label) for m in monitors):
-            raise ValueError("address_in_label")
+        errors = {}
+        for index, row in enumerate(rows):
+            label = row.get("label")
+            if not valid_label_syntax(label) or any(secret in label for secret in private):
+                errors[index] = "invalid_label"
+            elif contains_network_address(label):
+                errors[index] = "address_in_label"
+        return errors
+
+    @classmethod
+    def validate_labels(cls, identity, monitors):
+        errors = cls.label_errors(identity, [monitor.local(2) for monitor in monitors])
+        if errors:
+            raise ValueError(next(iter(errors.values())))
 
     def _commit(self, current, monitors, activation):
+        limit = exceeded_limit(monitor_usage(monitors))
+        if limit:
+            raise ValueError(limit)
         if current.enabled and current.monitors == monitors and current.activation_generation == activation:
             return current
         selected = Selection(current.scope, new_id(), True, False, monitors, activation)

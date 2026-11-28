@@ -9,10 +9,10 @@ import unittest
 from unittest.mock import AsyncMock, patch
 
 from test_homeview import FakePortal, IDENTITY, MONITORS, T, pairing, state
-from homeview import HomeviewRuntime, Reporter, parse_config
+from homeview import HomeviewRuntime, Reporter, ReviewError, parse_config
 from homeview_catalog import Catalog, CatalogError, is_core_admin
 from homeview_checks import Collector, RequestFailure, entity_observation, stamp
-from homeview_config import Settings, contains_network_address, parse_monitors
+from homeview_config import Settings, contains_network_address, monitor_usage, parse_monitors
 
 
 def fixture(name):
@@ -79,11 +79,13 @@ class CatalogTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual((await catalog.page(IDENTITY.scope, "0899", 0))["items"][0]["hint"], "light.item_0899")
         catalog.fetch.assert_awaited_once()
         key = first["items"][0]["key"]
-        self.assertIsNone(catalog.lookup(("other",), key))
+        self.assertNotIn(key, await catalog.inventory(("other",)))
         clock[0] = 61
-        self.assertIsNone(catalog.lookup(IDENTITY.scope, key))
-        await catalog.page(IDENTITY.scope, "", 0)
-        self.assertEqual(catalog.fetch.await_count, 2)
+        self.assertIn(key, await catalog.inventory(IDENTITY.scope))
+        self.assertEqual(catalog.fetch.await_count, 3)
+        clock[0] = 122
+        self.assertIn(key, await catalog.inventory(IDENTITY.scope))
+        self.assertEqual(catalog.fetch.await_count, 4)
 
     async def test_admin_uses_core_record_and_fails_closed(self):
         for args, verdict in [
@@ -197,6 +199,129 @@ ACCEPTED_ADDRESS_LABELS = (
 
 
 class SettingsAndProtocolTests(unittest.IsolatedAsyncioTestCase):
+    async def test_device_suggestions_use_current_name_and_validate_each_row(self):
+        with tempfile.TemporaryDirectory() as directory:
+            now = [0]
+            runtime = HomeviewRuntime(Path(directory) / "homeview.json", pairing, lambda: now[0])
+            devices = [{"id": f"device-{index}", "name": name} for index, name in enumerate(
+                ("Factory name", "printer.local", "x" * 65, "device-3", "Bearer synthetic"))]
+            devices[0]["name_by_user"] = "Front sensor"
+            registry = [{"id": f"registry-{index}", "device_id": device["id"], "entity_id": f"sensor.demo_{index}"}
+                        for index, device in enumerate(devices)]
+            states = [state(row["entity_id"], "72") for row in registry]
+            runtime.catalog.fetch = AsyncMock(return_value=(devices, registry, states))
+            page = await runtime.discover("", 0)
+            keys = {item["hint"]: item["key"] for item in page["items"]}
+            ha = {"kind": "ha_api", "label": "Core"}
+            rows = [{"kind": "entity_availability", "key": keys[row["entity_id"]]} for row in registry]
+            revision = runtime.view()["revision"]
+            with self.assertRaises(ReviewError) as error:
+                await runtime.preview("admin", {"revision": revision, "monitors": [ha, *rows]})
+            self.assertEqual(error.exception.rows, dict.fromkeys(range(2, 6), "custom_label_required"))
+            for index, row in enumerate(rows[1:], 1):
+                row["label"] = f"Custom sensor {index}"
+            draft = {"revision": revision, "monitors": [ha, *rows]}
+            first = await runtime.preview("admin", draft)
+            self.assertEqual([m["label"] for m in first["monitors"]],
+                             ["Core", "Front sensor", *(f"Custom sensor {i}" for i in range(1, 5))])
+            runtime.confirm("admin", first["preview"])
+            saved = runtime.view()
+            devices[0]["name_by_user"] = "Renamed sensor"
+            now[0] = 61
+            retained = await runtime.preview("admin", {"revision": saved["revision"], "monitors": [
+                ha, *({"saved": m["id"], "kind": m["kind"], "label": m["label"]} for m in saved["monitors"][1:]),
+            ]})
+            self.assertEqual(retained["monitors"][1]["label"], "Front sensor")
+            renamed = await runtime.preview("admin", draft | {"revision": saved["revision"]})
+            self.assertEqual(renamed["monitors"][1]["label"], "Renamed sensor")
+            self.assertEqual(runtime.view(), saved)
+            runtime.confirm("admin", renamed["preview"])
+            self.assertEqual(runtime.view()["monitors"][1]["id"], saved["monitors"][1]["id"])
+            self.assertEqual(runtime.view()["monitors"][1]["label"], "Renamed sensor")
+
+    async def test_expired_inventory_marks_only_changed_rows_and_retry_keeps_identity(self):
+        with tempfile.TemporaryDirectory() as directory:
+            now = [0]
+            runtime = HomeviewRuntime(Path(directory) / "homeview.json", pairing, lambda: now[0])
+            runtime.catalog.fetch = AsyncMock(return_value=(DEVICES, REGISTRY, STATES))
+            page = await runtime.discover("", 0)
+            keys = {item["hint"]: item["key"] for item in page["items"]}
+            inventory = [
+                {**row, "device_id": "hall"} if row["id"] == "contact-id"
+                else {**row, "id": "replacement-id"} if row["id"] == "switch-id" else row
+                for row in REGISTRY
+            ]
+            refreshed_states = [
+                {**row, "state": "unavailable"} if row["entity_id"] == "light.hall" else row
+                for row in STATES
+            ]
+            now[0] = 61
+            runtime.catalog.fetch.side_effect = [CatalogError("core_unavailable"), (DEVICES, inventory, refreshed_states)]
+            revision = runtime.view()["revision"]
+            rows = [{"kind": "ha_api", "label": "Core"},
+                    {"kind": "entity_availability", "key": keys["binary_sensor.front"]},
+                    {"kind": "entity_availability", "key": keys["light.hall"]},
+                    {"kind": "entity_switch", "key": keys["light.hall"]},
+                    {"kind": "entity_availability", "key": keys["switch.hall"]}]
+            with self.assertRaisesRegex(CatalogError, "core_unavailable"):
+                await runtime.preview("admin", {"revision": revision, "monitors": rows})
+            with self.assertRaises(ReviewError) as error:
+                await runtime.preview("admin", {"revision": revision, "monitors": rows})
+            self.assertEqual(error.exception.rows, {1: "entity_changed", 3: "check_changed", 4: "entity_changed"})
+            result = await runtime.preview("admin", {"revision": revision, "monitors": [rows[0], rows[2]]})
+            self.assertEqual([m["label"] for m in result["monitors"]], ["Core", "Entry"])
+            self.assertEqual(runtime.catalog.fetch.await_count, 3)
+
+    async def test_upgrade_preserves_over_limit_settings_stops_and_resumes_after_review(self):
+        with tempfile.TemporaryDirectory() as directory:
+            file = Path(directory) / "homeview.json"
+            ha = {"id": "ha", "kind": "ha_api", "label": "Core"}
+            entities = [{"id": f"sensor-{i}", "kind": "entity_availability", "entity": f"sensor.item_{i}",
+                         "label": f"Sensor {i}"} for i in range(6)]
+            value = {**entities[0], "id": "battery", "kind": "battery_percent", "label": "Battery", "lowThreshold": 25}
+            tcp = [{"id": f"tcp-{i}", "kind": "tcp_service", "label": f"Service {i}", "ip": "10.1.1.5", "port": 9000 + i}
+                   for i in range(4)]
+            saved = {"scope": list(IDENTITY.scope), "revision": "previous", "enabled": True, "disable_pending": False,
+                     "monitors": [ha, *entities, value, *tcp]}
+            file.write_text(json.dumps(saved))
+            runtime = HomeviewRuntime(file, pairing)
+            selection = runtime.settings.get(IDENTITY)
+            self.assertEqual(monitor_usage(selection.monitors), {"devices": 6, "tcpServices": 4})
+            view = runtime.view()
+            self.assertEqual(view["status"], "over_limit")
+            self.assertTrue(view["enabled"])
+            self.assertEqual(len(view["monitors"]), 12)
+            self.assertEqual(view["monitors"][1]["deviceSlot"], view["monitors"][7]["deviceSlot"])
+            self.assertTrue(view["monitors"][1]["legacyDevice"])
+            self.assertEqual(json.loads(file.read_text()), saved)
+            portal = FakePortal()
+            collector = AsyncMock()
+            reporter = runtime.reporter
+            await reporter.step(selection, IDENTITY, portal, collector, lambda: True, lambda: None)
+            collector.collect.assert_not_awaited()
+            self.assertEqual((portal.manifests, portal.reports, reporter.lease), ([], [], 0))
+
+            runtime.apply({"enabled": False})
+            disabled = runtime.settings.get(IDENTITY)
+            self.assertEqual(disabled.monitors, selection.monitors)
+            await reporter.step(disabled, IDENTITY, portal, collector, lambda: True,
+                                lambda: runtime.settings.acknowledge_disable(IDENTITY, disabled.revision))
+            self.assertFalse(json.loads(portal.manifests[-1])["enabled"])
+            self.assertEqual(runtime.view()["status"], "off")
+
+            kept = [ha, *entities[:5], value, *tcp[:3]]
+            rows = [{k: v for k, v in row.items() if k != "id"} if "entity" not in row else
+                    {k: v for k, v in row.items() if k not in ("id", "entity")} | {"saved": row["id"]} for row in kept]
+            review = await runtime.preview("admin", {"revision": disabled.revision, "monitors": rows})
+            runtime.confirm("admin", review["preview"])
+            corrected = runtime.settings.get(IDENTITY)
+            self.assertEqual([m.id for m in corrected.monitors], [row["id"] for row in kept])
+            self.assertEqual(corrected.monitors[6].low_threshold, 25)
+            collector.collect.return_value = None
+            await reporter.step(corrected, IDENTITY, portal, collector, lambda: True, lambda: None)
+            self.assertTrue(json.loads(portal.manifests[-1])["enabled"])
+            collector.collect.assert_awaited_once()
+
     def test_v1_and_v2_match_portal_shared_label_corpus(self):
         for v2 in (False, True):
             for label in REJECTED_ADDRESS_LABELS + ACCEPTED_ADDRESS_LABELS:
@@ -211,9 +336,13 @@ class SettingsAndProtocolTests(unittest.IsolatedAsyncioTestCase):
                         monitors = parse_monitors(rows, v2=v2)
                         Settings.validate_labels(IDENTITY, monitors)
                         self.assertEqual(monitors[0].manifest(2 if v2 else 1)["label"], label)
-            for label in ("", None, " Hall", "Hall ", "Hall\u0085light", "Hall\u202elight", "Hall\u2066light", "🚪" * 65):
+            for label in ("", None, " Hall", "Hall ", "\ufeffHall", "Hall\ufeff", "Hall\u0085light",
+                          "Hall\u202elight", "Hall\u2066light", "🚪" * 65):
                 with self.subTest(v2=v2, label=label), self.assertRaisesRegex(ValueError, "^invalid_label$"):
                     parse_monitors([{"kind": "ha_api", "label": label}], v2=v2)
+            for label in ("Hall\ufefflight", "\u200bHall"):
+                with self.subTest(v2=v2, label=label):
+                    self.assertEqual(parse_monitors([{"kind": "ha_api", "label": label}], v2=v2)[0].label, label)
 
     def test_addon_keeps_stricter_private_label_checks(self):
         entity = parse_monitors([{**CONTACT, "entity": "binary_sensor._private"}], v2=True)[0]
@@ -232,10 +361,10 @@ class SettingsAndProtocolTests(unittest.IsolatedAsyncioTestCase):
             label = "Door //router:8123"
             body = {"revision": revision, "monitors": [{"kind": "ha_api", "label": label}]}
             with self.assertRaisesRegex(ValueError, "^address_in_label$"):
-                runtime.preview("admin", body)
+                await runtime.preview("admin", body)
             # Simulate a preview issued before the address check identified this form.
             with patch("homeview_config.contains_network_address", return_value=False):
-                preview = runtime.preview("admin", body)
+                preview = await runtime.preview("admin", body)
             with self.assertRaisesRegex(ValueError, "^address_in_label$"):
                 runtime.confirm("admin", preview["preview"])
             self.assertFalse(runtime.view()["enabled"])
@@ -244,6 +373,8 @@ class SettingsAndProtocolTests(unittest.IsolatedAsyncioTestCase):
     async def test_saved_prohibited_labels_preserve_selection_and_discard_pending_payloads(self):
         for config, label in (
             (FakePortal().value, "Door //router:8123"),
+            (FakePortal().value, "\ufeffCore"),
+            (FakePortal().value, "Core\ufeff"),
             (fixture("configBeforeActivation"), "ｈｔｔｐ：／／router:8123"),
             (fixture("configBeforeActivation"), "http://router:8123"),
         ):
@@ -288,7 +419,7 @@ class SettingsAndProtocolTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(json.loads(file.read_text()), saved)
                 rows = [{key: value for key, value in row.items() if key != "id"} for row in saved["monitors"]]
                 rows[0]["label"] = "Core"
-                preview = runtime.preview("admin", {"revision": selection.revision, "monitors": rows})
+                preview = await runtime.preview("admin", {"revision": selection.revision, "monitors": rows})
                 runtime.confirm("admin", preview["preview"])
                 corrected = runtime.settings.get(IDENTITY)
                 self.assertNotEqual(corrected.revision, selection.revision)
@@ -310,11 +441,11 @@ class SettingsAndProtocolTests(unittest.IsolatedAsyncioTestCase):
             rows = [{"key": key, "kind": "entity_availability", "label": "Front door"},
                     {"key": key, "kind": "entity_contact", "label": "Front door"}]
             body = {"revision": view["revision"], "monitors": rows}
-            preview = runtime.preview("admin", body)
+            preview = await runtime.preview("admin", body)
             self.assertEqual(preview["monitors"], [{k: v for k, v in row.items() if k != "key"} for row in rows])
             with self.assertRaisesRegex(ValueError, "selection_changed"):
                 runtime.confirm("someone-else", preview["preview"])
-            preview = runtime.preview("admin", body)
+            preview = await runtime.preview("admin", body)
             runtime.confirm("admin", preview["preview"])
             selection = Settings(state_file).get(IDENTITY)
             self.assertTrue(selection.enabled)
@@ -329,7 +460,7 @@ class SettingsAndProtocolTests(unittest.IsolatedAsyncioTestCase):
             legacy = runtime.view()
             runtime.reporter.key = (IDENTITY, legacy["revision"])
             runtime.reporter.accept_config(parse_config(fixture("config")))
-            active_preview = runtime.preview("admin", {"revision": legacy["revision"], "monitors": rows})
+            active_preview = await runtime.preview("admin", {"revision": legacy["revision"], "monitors": rows})
             identity["home_id"] = "different-home"
             with self.assertRaisesRegex(ValueError, "selection_changed"):
                 runtime.confirm("admin", active_preview["preview"])
@@ -354,11 +485,11 @@ class SettingsAndProtocolTests(unittest.IsolatedAsyncioTestCase):
             self.assertIsNone(stored.activation_generation)
             self.assertEqual(json.loads(file.read_text()), legacy)
             with self.assertRaisesRegex(ValueError, "v2_required"):
-                runtime.preview("admin", {"revision": "v1-save", "monitors": [
+                await runtime.preview("admin", {"revision": "v1-save", "monitors": [
                     {"kind": "tcp_service", "label": "Camera", "ip": "192.168.1.23", "port": 443}
                 ]})
             with self.assertRaisesRegex(ValueError, "no_checks"):
-                runtime.preview("admin", {"revision": "v1-save", "monitors": []})
+                await runtime.preview("admin", {"revision": "v1-save", "monitors": []})
 
     async def test_v2_activation_400_remains_retryable_with_exact_payloads(self):
         portal = FakePortal()

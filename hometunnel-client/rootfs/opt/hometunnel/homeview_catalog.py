@@ -144,6 +144,8 @@ class Candidate:
     name: str
     device_name: str
     kind: str | None
+    suggested_label: str | None
+    available: bool
 
 
 class Catalog:
@@ -156,34 +158,37 @@ class Catalog:
         self.scope = None
         self.expires = 0
 
-    def handle(self, scope, registry):
-        return hmac.new(self.secret, json.dumps((scope, registry)).encode(), hashlib.sha256).hexdigest()
+    def handle(self, scope, namespace, *identity):
+        return hmac.new(self.secret, json.dumps((scope, namespace, identity)).encode(), hashlib.sha256).hexdigest()
 
-    async def page(self, scope, search, offset):
+    def selector(self, scope, registry, device):
+        # A move to another device must invalidate existing picker selections.
+        return self.handle(scope, "entity", registry, device)
+
+    async def inventory(self, scope):
         async with self.lock:
             if scope != self.scope or self.clock() >= self.expires:
                 devices, registry, states = await self.fetch((DEVICE_REGISTRY, ENTITY_REGISTRY, CORE_STATES))
                 self.items = self.build(scope, devices, registry, states)
                 self.scope, self.expires = scope, self.clock() + CATALOG_TTL
-            matches = [(key, item) for key, item in self.items.items()
-                       if search in f"{item.device_name} {item.name} {item.entity}".casefold()]
-            rows = []
-            for key, item in matches[offset:offset + PAGE_SIZE]:
-                rows.append({"key": key, "name": item.name, "device": item.device_name,
-                             "group": self.handle(scope, item.device), "hint": item.entity, "kind": item.kind})
-            next_offset = offset + PAGE_SIZE
-            return {"items": rows, "next": next_offset if len(matches) > next_offset else None}
+            return self.items
 
-    def lookup(self, scope, key):
-        if scope != self.scope or self.clock() >= self.expires:
-            return None
-        return self.items.get(key)
+    async def page(self, scope, search, offset):
+        items = await self.inventory(scope)
+        matches = [(key, item) for key, item in items.items()
+                   if item.available and search in f"{item.device_name} {item.name} {item.entity}".casefold()]
+        rows = [{"key": key, "name": item.name, "device": item.device_name,
+                 "group": self.handle(scope, "device", item.device), "hint": item.entity, "kind": item.kind}
+                for key, item in matches[offset:offset + PAGE_SIZE]]
+        next_offset = offset + PAGE_SIZE
+        return {"items": rows, "next": next_offset if len(matches) > next_offset else None}
 
     def build(self, scope, devices, registry, states):
         device_names = {}
         for row in devices:
             if isinstance(row, dict) and is_id(row.get("id")) and row.get("entry_type") != "service" and row.get("disabled_by") is None:
-                device_names[row["id"]] = clean_name(row.get("name_by_user") or row.get("name"), "Unnamed device")
+                name = row.get("name_by_user") or row.get("name")
+                device_names[row["id"]] = name if isinstance(name, str) else None
         states_by_id = {}
         for row in states:
             if isinstance(row, dict) and isinstance(row.get("entity_id"), str):
@@ -195,11 +200,13 @@ class Catalog:
             if device not in device_names or not state:
                 continue
             value = state.get("state")
-            if not isinstance(value, str) or not value.strip() or value in ("unknown", "unavailable"):
+            if not isinstance(value, str) or not value.strip():
                 continue
             attributes = state.get("attributes")
             attributes = attributes if isinstance(attributes, dict) else {}
             name = clean_name(attributes.get("friendly_name"), entity.split(".", 1)[1].replace("_", " ").capitalize())
-            items.append(Candidate(entity, registry_id, device, name, device_names[device], entity_kind(entity, attributes)))
+            suggestion = device_names[device]
+            items.append(Candidate(entity, registry_id, device, name, clean_name(suggestion, "Unnamed device"),
+                                   entity_kind(entity, attributes), suggestion, value not in ("unknown", "unavailable")))
         items.sort(key=lambda item: (item.device_name.casefold(), item.device, item.name.casefold(), item.entity))
-        return {self.handle(scope, item.registry): item for item in items}
+        return {self.selector(scope, item.registry, item.device): item for item in items}

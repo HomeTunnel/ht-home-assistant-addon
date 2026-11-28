@@ -40,7 +40,7 @@ from network_context import (
     normalize_home_assistant_access_mode as normalize_ha_access_mode,
 )
 from heartbeat_payload import build_heartbeat_payload
-from homeview import HomeviewRuntime
+from homeview import HomeviewRuntime, ReviewError
 from homeview_catalog import CatalogError, MAX_ENTRIES, is_core_admin
 
 DATA_DIR = Path("/data")
@@ -6718,9 +6718,11 @@ def homeview_error(exc) -> JSONResponse:
         return homeview_response({"error": code}, 403 if code == "permission_denied" else 503)
     if isinstance(exc, OSError):
         return homeview_response({"error": "settings_unavailable"}, 503)
-    if code in ("selection_changed", "inventory_expired", "v2_required"):
+    if isinstance(exc, ReviewError):
+        return homeview_response({"error": code, "rowErrors": exc.rows}, 400)
+    if code in ("selection_changed", "confirmation_expired", "v2_required"):
         return homeview_response({"error": code}, 409)
-    if code == "address_in_label":
+    if code in ("address_in_label", "invalid_label", "device_limit", "tcp_limit"):
         return homeview_response({"error": code}, 400)
     return homeview_response({"error": "no_checks" if code == "no_checks" else "invalid_settings"}, 400)
 
@@ -6774,8 +6776,11 @@ async def api_homeview_preview(request: Request) -> JSONResponse:
         body = await read_homeview_body(request)
         if body is None:
             return homeview_response({"error": "invalid_settings"}, 415)
-        return homeview_response(homeview.preview(user, body))
-    except (CatalogError, ValueError, OSError, RecursionError, TimeoutError) as exc:
+        async with asyncio.timeout(8):
+            return homeview_response(await homeview.preview(user, body))
+    except TimeoutError:
+        return homeview_error(CatalogError("core_unavailable"))
+    except (CatalogError, ValueError, OSError, RecursionError) as exc:
         return homeview_error(exc)
 
 
@@ -6984,9 +6989,11 @@ def index() -> str:
               <label id="homeview-ha-label-row">Shared label <input id="homeview-ha-label" maxlength="64"></label>
             </fieldset>
             <fieldset>
-              <legend>Devices and entities</legend>
+              <legend>Devices and entities — up to 5 devices</legend>
+              <p id="homeview-device-count" class="muted" aria-live="polite"></p>
+              <p id="homeview-legacy-devices" class="muted" hidden>Each saved entity without a verified device identity counts as one device. To group it with its device, remove it and select it again from the picker.</p>
               <div id="homeview-entities"></div>
-              <button id="homeview-open-picker" type="button" class="secondary">Find an entity</button>
+              <button id="homeview-open-picker" type="button" class="secondary" disabled>Find an entity</button>
               <div id="homeview-picker" hidden>
                 <label>Search devices or entities <input id="homeview-search" type="search" maxlength="100"></label>
                 <label>Available entities <select id="homeview-results"></select></label>
@@ -6999,12 +7006,13 @@ def index() -> str:
               </div>
             </fieldset>
             <fieldset>
-              <legend>Local TCP services</legend>
+              <legend>Local TCP services — up to 3 services</legend>
+              <p id="homeview-tcp-count" class="muted" aria-live="polite"></p>
               <div id="homeview-services"></div>
-              <button id="homeview-add-tcp" type="button" class="secondary">Add TCP service</button>
+              <button id="homeview-add-tcp" type="button" class="secondary" disabled>Add TCP service</button>
             </fieldset>
             <div class="actions">
-              <button type="submit" id="homeview-review">Review sharing</button>
+              <button type="submit" id="homeview-review" disabled>Review sharing</button>
               <button type="button" class="secondary" id="homeview-disable" hidden>Stop sharing</button>
             </div>
             <p class="muted">Choose at least one check to enable monitoring.</p>
