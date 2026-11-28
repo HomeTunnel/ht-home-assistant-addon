@@ -1,0 +1,26 @@
+{
+  "schemaVersion": 1,
+  "bootId": "boot-1",
+  "requestId": "request-1",
+  "expectedRevision": 0,
+  "enabled": true,
+  "monitors": [
+    {
+      "id": "ha",
+      "kind": "ha_api",
+      "label": "Home Assistant"
+    },
+    {
+      "id": "camera",
+      "kind": "tcp_service",
+      "label": "Camera port"
+    },
+    {
+      "id": "door",
+      "kind": "battery_percent",
+      "label": "Front door battery",
+      "lowThreshold": 20
+    }
+  ],
+  "consentGeneration": "consent-1"
+}

@@ -1,0 +1,28 @@
+{
+  "schemaVersion": 1,
+  "sessionId": "session-1",
+  "manifestRevision": 1,
+  "sequence": 1,
+  "observedAt": "2026-11-24T19:12:00.000Z",
+  "observations": [
+    {
+      "monitorId": "ha",
+      "checkedAt": "2026-11-24T19:12:00.000Z",
+      "source": "supervisor_core_api",
+      "result": "responding"
+    },
+    {
+      "monitorId": "camera",
+      "checkedAt": "2026-11-24T19:12:00.000Z",
+      "source": "local_tcp",
+      "result": "not_responding"
+    },
+    {
+      "monitorId": "door",
+      "checkedAt": "2026-11-24T19:12:00.000Z",
+      "source": "home_assistant_entity",
+      "result": "reading",
+      "batteryPercent": 17
+    }
+  ]
+}

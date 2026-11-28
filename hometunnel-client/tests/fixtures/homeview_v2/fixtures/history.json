@@ -1,0 +1,34 @@
+{
+  "schemaVersion": 2,
+  "events": [
+    {
+      "id": "event-2",
+      "incident": {
+        "id": "camera-incident",
+        "monitorId": "camera",
+        "label": "Camera port",
+        "rule": "tcp_unreachable",
+        "firstObservedAt": "2026-11-24T19:10:00.000Z",
+        "confirmedAt": "2026-11-24T19:12:00.000Z"
+      },
+      "type": "health.incident.resolved",
+      "observedAt": "2026-11-24T19:19:00.000Z",
+      "recordedAt": "2026-11-24T19:20:00.000Z"
+    },
+    {
+      "id": "event-1",
+      "incident": {
+        "id": "camera-incident",
+        "monitorId": "camera",
+        "label": "Camera port",
+        "rule": "tcp_unreachable",
+        "firstObservedAt": "2026-11-24T19:10:00.000Z",
+        "confirmedAt": "2026-11-24T19:12:00.000Z"
+      },
+      "type": "health.incident.opened",
+      "observedAt": "2026-11-24T19:10:00.000Z",
+      "recordedAt": "2026-11-24T19:12:00.000Z"
+    }
+  ],
+  "nextCursor": null
+}
